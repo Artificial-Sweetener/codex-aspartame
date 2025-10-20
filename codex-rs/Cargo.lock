@@ -952,6 +952,8 @@ dependencies = [
  "anyhow",
  "assert_cmd",
  "assert_matches",
+ "base64",
+ "chrono",
  "clap",
  "clap_complete",
  "codex-app-server",
@@ -974,10 +976,13 @@ dependencies = [
  "owo-colors",
  "predicates",
  "pretty_assertions",
+ "schemars 0.8.22",
+ "serde",
  "serde_json",
  "supports-color",
  "tempfile",
  "tokio",
+ "uuid",
 ]
 
 [[package]]
