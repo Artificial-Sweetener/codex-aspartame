@@ -19,6 +19,7 @@ use std::pin::Pin;
 use std::task::Context;
 use std::task::Poll;
 use tokio::sync::mpsc;
+use tokio::sync::oneshot;
 
 /// Review thread system prompt. Edit `core/src/review_prompt.md` to customize.
 pub const REVIEW_PROMPT: &str = include_str!("../review_prompt.md");
@@ -375,6 +376,7 @@ pub(crate) fn create_text_param_for_request(
 
 pub struct ResponseStream {
     pub(crate) rx_event: mpsc::Receiver<Result<ResponseEvent>>,
+    pub(crate) final_usage: Option<oneshot::Receiver<Option<TokenUsage>>>,
 }
 
 impl Stream for ResponseStream {
@@ -382,6 +384,12 @@ impl Stream for ResponseStream {
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         self.rx_event.poll_recv(cx)
+    }
+}
+
+impl ResponseStream {
+    pub(crate) fn take_final_usage(&mut self) -> Option<oneshot::Receiver<Option<TokenUsage>>> {
+        self.final_usage.take()
     }
 }
 

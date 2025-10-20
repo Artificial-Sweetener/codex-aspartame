@@ -2,6 +2,7 @@ use std::borrow::Cow;
 use std::fmt::Debug;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
 use std::sync::atomic::AtomicU64;
 
 use crate::AuthManager;
@@ -47,7 +48,9 @@ use tracing::warn;
 
 use crate::ModelProviderInfo;
 use crate::apply_patch::convert_apply_patch_to_protocol;
+use crate::auth::AccountSelection;
 use crate::client::ModelClient;
+use crate::client::compute_cooldown_deadline;
 use crate::client_common::Prompt;
 use crate::client_common::ResponseEvent;
 use crate::config::Config;
@@ -112,6 +115,7 @@ use crate::state::TaskKind;
 use crate::tasks::CompactTask;
 use crate::tasks::RegularTask;
 use crate::tasks::ReviewTask;
+use crate::token_data::PlanType;
 use crate::tools::ToolRouter;
 use crate::tools::context::SharedTurnDiffTracker;
 use crate::tools::format_exec_output_str;
@@ -121,6 +125,9 @@ use crate::unified_exec::UnifiedExecSessionManager;
 use crate::user_instructions::UserInstructions;
 use crate::user_notification::UserNotification;
 use crate::util::backoff;
+use chrono::DateTime;
+use chrono::SecondsFormat;
+use chrono::Utc;
 use codex_async_utils::OrCancelExt;
 use codex_otel::otel_event_manager::OtelEventManager;
 use codex_protocol::config_types::ReasoningEffort as ReasoningEffortConfig;
@@ -131,6 +138,7 @@ use codex_protocol::models::FunctionCallOutputPayload;
 use codex_protocol::models::ResponseInputItem;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::InitialHistory;
+use uuid::Uuid;
 
 pub mod compact;
 use self::compact::build_compacted_history;
@@ -272,6 +280,7 @@ pub(crate) struct TurnContext {
     pub(crate) tools_config: ToolsConfig,
     pub(crate) is_review_mode: bool,
     pub(crate) final_output_json_schema: Option<Value>,
+    pub(crate) account_snapshot: StdMutex<Option<TurnAccountSnapshot>>,
 }
 
 impl TurnContext {
@@ -279,6 +288,37 @@ impl TurnContext {
         path.as_ref()
             .map(PathBuf::from)
             .map_or_else(|| self.cwd.clone(), |p| self.cwd.join(p))
+    }
+
+    pub(crate) fn set_account_snapshot(&self, snapshot: Option<TurnAccountSnapshot>) {
+        if let Ok(mut guard) = self.account_snapshot.lock() {
+            *guard = snapshot;
+        }
+    }
+
+    pub(crate) fn account_snapshot(&self) -> Option<TurnAccountSnapshot> {
+        self.account_snapshot
+            .lock()
+            .ok()
+            .and_then(|guard| guard.clone())
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct TurnAccountSnapshot {
+    pub id: Uuid,
+    pub label: Option<String>,
+    pub plan_type: Option<PlanType>,
+}
+
+impl TurnAccountSnapshot {
+    fn from_selection(selection: &AccountSelection) -> Self {
+        let plan_type = selection.auth.get_plan_type();
+        Self {
+            id: selection.id,
+            label: selection.label.clone(),
+            plan_type,
+        }
     }
 }
 
@@ -404,6 +444,7 @@ impl Session {
             tools_config,
             is_review_mode: false,
             final_output_json_schema: None,
+            account_snapshot: StdMutex::new(None),
         }
     }
 
@@ -1645,6 +1686,7 @@ async fn spawn_review_thread(
         cwd: parent_turn_context.cwd.clone(),
         is_review_mode: true,
         final_output_json_schema: None,
+        account_snapshot: StdMutex::new(None),
     };
 
     // Seed the child task with the review prompt as the initial user message.
@@ -2007,6 +2049,138 @@ async fn run_turn(
     task_kind: TaskKind,
     cancellation_token: CancellationToken,
 ) -> CodexResult<TurnRunResult> {
+    let Some(auth_manager) = turn_context.client.get_auth_manager() else {
+        turn_context.client.set_account_selection(None);
+        turn_context.set_account_snapshot(None);
+        return run_turn_once(
+            sess,
+            turn_context,
+            turn_diff_tracker,
+            sub_id,
+            input,
+            task_kind,
+            cancellation_token,
+        )
+        .await;
+    };
+
+    let mut aggregated_errors = Vec::new();
+    let mut attempted_accounts = Vec::new();
+
+    loop {
+        let now = Utc::now();
+        let selection = auth_manager
+            .available_accounts(now)
+            .into_iter()
+            .find(|account| !attempted_accounts.contains(&account.id));
+
+        let Some(selection) = selection else {
+            if aggregated_errors.is_empty() {
+                return Err(CodexErr::Fatal(
+                    "No authenticated accounts are available for this request".to_string(),
+                ));
+            }
+            let summary = aggregated_errors.join("\n");
+            return Err(CodexErr::Fatal(format!(
+                "All accounts are unavailable:\n{summary}"
+            )));
+        };
+
+        turn_context
+            .client
+            .set_account_selection(Some(selection.clone()));
+        turn_context.set_account_snapshot(Some(TurnAccountSnapshot::from_selection(&selection)));
+
+        match run_turn_once(
+            Arc::clone(&sess),
+            Arc::clone(&turn_context),
+            Arc::clone(&turn_diff_tracker),
+            sub_id.clone(),
+            input.clone(),
+            task_kind,
+            cancellation_token.child_token(),
+        )
+        .await
+        {
+            Ok(result) => {
+                if let Some(usage) = result.total_token_usage.clone()
+                    && let Err(err) = auth_manager.register_usage(selection.id, usage)
+                {
+                    debug!("failed to record usage: {err:#}");
+                }
+                return Ok(result);
+            }
+            Err(CodexErr::UsageLimitReached(err)) => {
+                if let Some(rate_limits) = err.rate_limits.clone() {
+                    sess.update_rate_limits(&sub_id, rate_limits).await;
+                }
+                let cooldown_until = err.resets_at.unwrap_or_else(|| {
+                    compute_cooldown_deadline(Utc::now(), err.resets_in_seconds)
+                });
+                let mut tokens_since_last = selection.tokens_since_last_cooldown.clone();
+                add_consumed_tokens(&mut tokens_since_last, err.tokens_consumed);
+                let reason = err.message.clone();
+                log_account_cooldown(
+                    &auth_manager,
+                    &sess,
+                    &sub_id,
+                    &selection,
+                    cooldown_until,
+                    &tokens_since_last,
+                    reason.clone(),
+                    err.request_id.clone(),
+                    err.rate_limits.clone(),
+                )
+                .await;
+                aggregated_errors.push(build_account_summary(
+                    &selection,
+                    cooldown_until,
+                    &tokens_since_last,
+                    reason,
+                    err.request_id.clone(),
+                ));
+                attempted_accounts.push(selection.id);
+            }
+            Err(CodexErr::UsageNotIncluded(err)) => {
+                let cooldown_until = compute_cooldown_deadline(Utc::now(), err.resets_in_seconds);
+                let mut tokens_since_last = selection.tokens_since_last_cooldown.clone();
+                add_consumed_tokens(&mut tokens_since_last, err.tokens_consumed);
+                let reason = err.message.clone();
+                log_account_cooldown(
+                    &auth_manager,
+                    &sess,
+                    &sub_id,
+                    &selection,
+                    cooldown_until,
+                    &tokens_since_last,
+                    reason.clone(),
+                    err.request_id.clone(),
+                    None,
+                )
+                .await;
+                aggregated_errors.push(build_account_summary(
+                    &selection,
+                    cooldown_until,
+                    &tokens_since_last,
+                    reason,
+                    err.request_id.clone(),
+                ));
+                attempted_accounts.push(selection.id);
+            }
+            Err(other) => return Err(other),
+        }
+    }
+}
+
+async fn run_turn_once(
+    sess: Arc<Session>,
+    turn_context: Arc<TurnContext>,
+    turn_diff_tracker: SharedTurnDiffTracker,
+    sub_id: String,
+    input: Vec<ResponseItem>,
+    task_kind: TaskKind,
+    cancellation_token: CancellationToken,
+) -> CodexResult<TurnRunResult> {
     let mcp_tools = sess.services.mcp_connection_manager.list_all_tools();
     let router = Arc::new(ToolRouter::from_config(
         &turn_context.tools_config,
@@ -2056,7 +2230,7 @@ async fn run_turn(
                 }
                 return Err(CodexErr::UsageLimitReached(e));
             }
-            Err(CodexErr::UsageNotIncluded) => return Err(CodexErr::UsageNotIncluded),
+            Err(CodexErr::UsageNotIncluded(err)) => return Err(CodexErr::UsageNotIncluded(err)),
             Err(e) => {
                 // Use the configured provider-specific stream retry budget.
                 let max_retries = turn_context.client.get_provider().stream_max_retries();
@@ -2371,6 +2545,98 @@ async fn try_run_turn(
             }
         }
     }
+}
+
+fn add_consumed_tokens(tokens: &mut TokenUsage, consumed: Option<u64>) {
+    if let Some(amount) = consumed {
+        tokens.total_tokens = tokens.total_tokens.saturating_add(amount);
+        tokens.input_tokens = tokens.input_tokens.saturating_add(amount);
+    }
+}
+
+async fn log_account_cooldown(
+    auth_manager: &Arc<AuthManager>,
+    sess: &Arc<Session>,
+    sub_id: &str,
+    selection: &AccountSelection,
+    cooldown_until: DateTime<Utc>,
+    tokens_since_last: &TokenUsage,
+    reason: Option<String>,
+    request_id: Option<String>,
+    snapshot: Option<RateLimitSnapshot>,
+) {
+    if let Err(err) = auth_manager.mark_cooldown(
+        selection.id,
+        cooldown_until,
+        reason.clone(),
+        tokens_since_last.clone(),
+        snapshot,
+    ) {
+        debug!("failed to record cooldown: {err:#}");
+    }
+
+    let label = selection
+        .label
+        .clone()
+        .unwrap_or_else(|| selection.id.to_string());
+    let total_tokens = tokens_since_last.total_tokens;
+    let remaining_secs = cooldown_until
+        .signed_duration_since(Utc::now())
+        .num_seconds()
+        .max(0) as u64;
+    let duration_text = format_duration_short(remaining_secs);
+    warn!(
+        account_id = %selection.id,
+        account_label = selection.label.as_deref().unwrap_or(""),
+        tokens_since_last = total_tokens,
+        cooldown_until = %cooldown_until.to_rfc3339_opts(SecondsFormat::Secs, true),
+        reason = reason.as_deref().unwrap_or(""),
+        request_id = request_id.as_deref().unwrap_or(""),
+        "account entered cooldown"
+    );
+    let message =
+        format!("Account {label} cooling down for {duration_text} after {total_tokens} tokens");
+    sess.notify_stream_error(sub_id, message).await;
+}
+
+fn build_account_summary(
+    selection: &AccountSelection,
+    cooldown_until: DateTime<Utc>,
+    tokens_since_last: &TokenUsage,
+    reason: Option<String>,
+    request_id: Option<String>,
+) -> String {
+    let label = selection
+        .label
+        .clone()
+        .unwrap_or_else(|| selection.id.to_string());
+    let mut summary = format!(
+        "{label}: cooldown until {} ({} tokens)",
+        cooldown_until.to_rfc3339_opts(SecondsFormat::Secs, true),
+        tokens_since_last.total_tokens,
+    );
+    if let Some(reason) = reason.filter(|r| !r.is_empty()) {
+        summary.push_str(&format!(", reason: {reason}"));
+    }
+    if let Some(req) = request_id.filter(|r| !r.is_empty()) {
+        summary.push_str(&format!(", request_id: {req}"));
+    }
+    summary
+}
+
+fn format_duration_short(seconds: u64) -> String {
+    if seconds >= 3600 {
+        let hours = seconds / 3600;
+        let minutes = (seconds % 3600) / 60;
+        let secs = seconds % 60;
+        return format!("{hours}h {minutes:02}m {secs:02}s");
+    }
+    if seconds >= 60 {
+        let minutes = seconds / 60;
+        let secs = seconds % 60;
+        return format!("{minutes}m {secs:02}s");
+    }
+    format!("{seconds}s")
 }
 
 async fn handle_non_tool_response_item(

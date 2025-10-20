@@ -323,7 +323,10 @@ pub(crate) async fn stream_chat_completions(
                     provider.stream_idle_timeout(),
                     otel_event_manager.clone(),
                 ));
-                return Ok(ResponseStream { rx_event });
+                return Ok(ResponseStream {
+                    rx_event,
+                    final_usage: None,
+                });
             }
             Ok(res) => {
                 let status = res.status();

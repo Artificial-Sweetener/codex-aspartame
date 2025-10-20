@@ -1,9 +1,11 @@
 use std::io::BufRead;
 use std::path::Path;
+use std::sync::Mutex as StdMutex;
 use std::sync::OnceLock;
 use std::time::Duration;
 
 use crate::AuthManager;
+use crate::auth::AccountSelection;
 use crate::auth::CodexAuth;
 use crate::error::ConnectionFailedError;
 use crate::error::ResponseStreamFailed;
@@ -21,11 +23,14 @@ use serde::Deserialize;
 use serde::Serialize;
 use serde_json::Value;
 use tokio::sync::mpsc;
+use tokio::sync::oneshot;
 use tokio::time::timeout;
 use tokio_util::io::ReaderStream;
 use tracing::debug;
 use tracing::trace;
 use tracing::warn;
+
+const DEFAULT_USAGE_COOLDOWN_SECONDS: u64 = 60;
 
 use crate::chat_completions::AggregateStreamExt;
 use crate::chat_completions::stream_chat_completions;
@@ -40,6 +45,7 @@ use crate::default_client::create_client;
 use crate::error::CodexErr;
 use crate::error::Result;
 use crate::error::UsageLimitReachedError;
+use crate::error::UsageNotIncludedError;
 use crate::flags::CODEX_RS_SSE_FIXTURE;
 use crate::model_family::ModelFamily;
 use crate::model_provider_info::ModelProviderInfo;
@@ -59,7 +65,6 @@ use codex_protocol::config_types::ReasoningEffort as ReasoningEffortConfig;
 use codex_protocol::config_types::ReasoningSummary as ReasoningSummaryConfig;
 use codex_protocol::models::ResponseItem;
 use std::sync::Arc;
-use uuid::Uuid;
 
 #[derive(Debug, Deserialize)]
 struct ErrorResponse {
@@ -75,6 +80,8 @@ struct Error {
     // Optional fields available on "usage_limit_reached" and "usage_not_included" errors
     plan_type: Option<PlanType>,
     resets_at: Option<String>,
+    resets_in_seconds: Option<u64>,
+    tokens_consumed: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -87,6 +94,7 @@ pub struct ModelClient {
     conversation_id: ConversationId,
     effort: Option<ReasoningEffortConfig>,
     summary: ReasoningSummaryConfig,
+    selected_account: Arc<StdMutex<Option<AccountSelection>>>,
 }
 
 impl ModelClient {
@@ -110,7 +118,21 @@ impl ModelClient {
             conversation_id,
             effort,
             summary,
+            selected_account: Arc::new(StdMutex::new(None)),
         }
+    }
+
+    pub fn set_account_selection(&self, selection: Option<AccountSelection>) {
+        if let Ok(mut guard) = self.selected_account.lock() {
+            *guard = selection;
+        }
+    }
+
+    pub fn current_account_selection(&self) -> Option<AccountSelection> {
+        self.selected_account
+            .lock()
+            .ok()
+            .and_then(|guard| guard.clone())
     }
 
     pub fn get_model_context_window(&self) -> Option<u64> {
@@ -173,7 +195,10 @@ impl ModelClient {
                     }
                 });
 
-                Ok(ResponseStream { rx_event: rx })
+                Ok(ResponseStream {
+                    rx_event: rx,
+                    final_usage: None,
+                })
             }
         }
     }
@@ -196,6 +221,15 @@ impl ModelClient {
         }
 
         let auth_manager = self.auth_manager.clone();
+        let mut account_selection = self.current_account_selection();
+        if account_selection.is_none()
+            && let Some(manager) = auth_manager.as_ref()
+        {
+            account_selection = manager.next_available(Utc::now());
+            if account_selection.is_some() {
+                self.set_account_selection(account_selection.clone());
+            }
+        }
 
         let full_instructions = prompt.get_full_instructions(&self.config.model_family);
         let tools_json = create_tools_json_for_responses_api(&prompt.tools)?;
@@ -262,7 +296,13 @@ impl ModelClient {
         let max_attempts = self.provider.request_max_retries();
         for attempt in 0..=max_attempts {
             match self
-                .attempt_stream_responses(attempt, &payload_json, &auth_manager, task_kind)
+                .attempt_stream_responses(
+                    attempt,
+                    &payload_json,
+                    &auth_manager,
+                    task_kind,
+                    account_selection.clone(),
+                )
                 .await
             {
                 Ok(stream) => {
@@ -291,11 +331,14 @@ impl ModelClient {
         payload_json: &Value,
         auth_manager: &Option<Arc<AuthManager>>,
         task_kind: TaskKind,
+        provided_selection: Option<AccountSelection>,
     ) -> std::result::Result<ResponseStream, StreamAttemptError> {
         // Always fetch the latest auth in case a prior attempt refreshed the token.
-        let account_selection = auth_manager
-            .as_ref()
-            .and_then(|manager| manager.next_available(Utc::now()));
+        let account_selection = provided_selection.clone().or_else(|| {
+            auth_manager
+                .as_ref()
+                .and_then(|manager| manager.next_available(Utc::now()))
+        });
         let auth = account_selection
             .as_ref()
             .map(|selection| selection.auth.clone());
@@ -350,6 +393,7 @@ impl ModelClient {
         match res {
             Ok(resp) if resp.status().is_success() => {
                 let (tx_event, rx_event) = mpsc::channel::<Result<ResponseEvent>>(1600);
+                let (usage_tx, usage_rx) = oneshot::channel();
 
                 if let Some(snapshot) = parse_rate_limit_snapshot(resp.headers())
                     && tx_event
@@ -367,18 +411,19 @@ impl ModelClient {
                         request_id: request_id.clone(),
                     })
                 });
-                let auth_manager_clone = auth_manager.clone();
-                let account_id = account_selection.as_ref().map(|selection| selection.id);
+                let usage_sender = Some(usage_tx);
                 tokio::spawn(process_sse(
                     stream,
                     tx_event,
                     self.provider.stream_idle_timeout(),
                     self.otel_event_manager.clone(),
-                    auth_manager_clone,
-                    account_id,
+                    usage_sender,
                 ));
 
-                Ok(ResponseStream { rx_event })
+                Ok(ResponseStream {
+                    rx_event,
+                    final_usage: Some(usage_rx),
+                })
             }
             Ok(res) => {
                 let status = res.status();
@@ -424,106 +469,48 @@ impl ModelClient {
                     let rate_limit_snapshot = parse_rate_limit_snapshot(res.headers());
                     let body = res.json::<ErrorResponse>().await.ok();
                     if let Some(ErrorResponse { error }) = body {
+                        let plan_type = error
+                            .plan_type
+                            .or_else(|| auth.as_ref().and_then(CodexAuth::get_plan_type));
+                        let resets_in_seconds = error.resets_in_seconds.or(retry_after_secs);
+                        let resets_at = error
+                            .resets_at
+                            .as_deref()
+                            .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+                            .map(|dt| dt.with_timezone(&Utc))
+                            .or_else(|| {
+                                resets_in_seconds
+                                    .map(|secs| compute_cooldown_deadline(Utc::now(), Some(secs)))
+                            });
                         if error.r#type.as_deref() == Some("usage_limit_reached") {
-                            // Prefer the plan_type provided in the error message if present
-                            // because it's more up to date than the one encoded in the auth
-                            // token.
-                            let plan_type = error
-                                .plan_type
-                                .or_else(|| auth.as_ref().and_then(CodexAuth::get_plan_type));
-                            let resets_at = error
-                                .resets_at
-                                .as_deref()
-                                .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
-                                .map(|dt| dt.with_timezone(&Utc));
                             let codex_err = CodexErr::UsageLimitReached(UsageLimitReachedError {
                                 plan_type,
                                 resets_at,
                                 rate_limits: rate_limit_snapshot.clone(),
+                                resets_in_seconds,
+                                request_id: request_id.clone(),
+                                tokens_consumed: error.tokens_consumed,
+                                message: error.message,
                             });
-                            if let (Some(manager), Some(selection)) =
-                                (auth_manager.as_ref(), account_selection.as_ref())
-                            {
-                                let expires_at = error
-                                    .resets_at
-                                    .as_deref()
-                                    .and_then(|value| {
-                                        DateTime::parse_from_rfc3339(value)
-                                            .ok()
-                                            .map(|dt| dt.with_timezone(&Utc))
-                                    })
-                                    .or_else(|| {
-                                        retry_after
-                                            .and_then(|duration| {
-                                                chrono::Duration::from_std(duration).ok()
-                                            })
-                                            .map(|duration| Utc::now() + duration)
-                                    })
-                                    .unwrap_or_else(Utc::now);
-                                let tokens_since_last =
-                                    selection.tokens_since_last_cooldown.clone();
-                                if let Err(err) = manager.mark_cooldown(
-                                    selection.id,
-                                    expires_at,
-                                    error.message.clone(),
-                                    tokens_since_last,
-                                    rate_limit_snapshot.clone(),
-                                ) {
-                                    debug!("failed to record cooldown: {err:#}");
-                                }
-                            }
                             return Err(StreamAttemptError::Fatal(codex_err));
-                        } else if error.r#type.as_deref() == Some("usage_not_included") {
-                            return Err(StreamAttemptError::Fatal(CodexErr::UsageNotIncluded));
-                        } else if let (Some(manager), Some(selection)) =
-                            (auth_manager.as_ref(), account_selection.as_ref())
-                        {
-                            let expires_at = error
-                                .resets_at
-                                .as_deref()
-                                .and_then(|value| {
-                                    DateTime::parse_from_rfc3339(value)
-                                        .ok()
-                                        .map(|dt| dt.with_timezone(&Utc))
-                                })
-                                .or_else(|| {
-                                    retry_after
-                                        .and_then(|duration| {
-                                            chrono::Duration::from_std(duration).ok()
-                                        })
-                                        .map(|duration| Utc::now() + duration)
-                                })
-                                .unwrap_or_else(Utc::now);
-                            let tokens_since_last = selection.tokens_since_last_cooldown.clone();
-                            let reason = error.message.clone();
-                            if let Err(err) = manager.mark_cooldown(
-                                selection.id,
-                                expires_at,
-                                reason,
-                                tokens_since_last,
-                                rate_limit_snapshot.clone(),
-                            ) {
-                                debug!("failed to record cooldown: {err:#}");
-                            }
                         }
-                    } else if let (Some(manager), Some(selection)) =
-                        (auth_manager.as_ref(), account_selection.as_ref())
-                    {
-                        let expires_at = retry_after
-                            .and_then(|duration| chrono::Duration::from_std(duration).ok())
-                            .map(|duration| Utc::now() + duration)
-                            .unwrap_or_else(Utc::now);
-                        let tokens_since_last = selection.tokens_since_last_cooldown.clone();
-                        if let Err(err) = manager.mark_cooldown(
-                            selection.id,
-                            expires_at,
-                            None,
-                            tokens_since_last,
-                            rate_limit_snapshot.clone(),
-                        ) {
-                            debug!("failed to record cooldown: {err:#}");
+                        if error.r#type.as_deref() == Some("usage_not_included") {
+                            let codex_err = CodexErr::UsageNotIncluded(UsageNotIncludedError {
+                                plan_type,
+                                resets_in_seconds,
+                                request_id: request_id.clone(),
+                                tokens_consumed: error.tokens_consumed,
+                                message: error.message,
+                            });
+                            return Err(StreamAttemptError::Fatal(codex_err));
                         }
                     }
+
+                    return Err(StreamAttemptError::RetryableHttpError {
+                        status,
+                        retry_after,
+                        request_id,
+                    });
                 }
 
                 Err(StreamAttemptError::RetryableHttpError {
@@ -754,13 +741,21 @@ fn parse_header_str<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
     headers.get(name)?.to_str().ok()
 }
 
+pub(crate) fn compute_cooldown_deadline(
+    now: DateTime<Utc>,
+    resets_in_seconds: Option<u64>,
+) -> DateTime<Utc> {
+    let seconds = resets_in_seconds.unwrap_or(DEFAULT_USAGE_COOLDOWN_SECONDS);
+    let seconds = seconds.min(i64::MAX as u64);
+    now + chrono::Duration::seconds(seconds as i64)
+}
+
 async fn process_sse<S>(
     stream: S,
     tx_event: mpsc::Sender<Result<ResponseEvent>>,
     idle_timeout: Duration,
     otel_event_manager: OtelEventManager,
-    auth_manager: Option<Arc<AuthManager>>,
-    account_id: Option<Uuid>,
+    mut usage_tx: Option<oneshot::Sender<Option<TokenUsage>>>,
 ) where
     S: Stream<Item = Result<Bytes>> + Unpin,
 {
@@ -783,6 +778,9 @@ async fn process_sse<S>(
                 debug!("SSE Error: {e:#}");
                 let event = CodexErr::Stream(e.to_string(), None);
                 let _ = tx_event.send(Err(event)).await;
+                if let Some(tx) = usage_tx.take() {
+                    let _ = tx.send(None);
+                }
                 return;
             }
             Ok(None) => {
@@ -807,12 +805,8 @@ async fn process_sse<S>(
                             );
                         }
                         let converted_usage: Option<TokenUsage> = usage.clone().map(Into::into);
-                        if let (Some(manager), Some(account_id), Some(usage)) =
-                            (auth_manager.as_ref(), account_id, converted_usage.as_ref())
-                        {
-                            if let Err(err) = manager.register_usage(account_id, usage.clone()) {
-                                debug!("failed to record usage: {err:#}");
-                            }
+                        if let Some(tx) = usage_tx.take() {
+                            let _ = tx.send(converted_usage.clone());
                         }
                         let event = ResponseEvent::Completed {
                             response_id,
@@ -828,6 +822,9 @@ async fn process_sse<S>(
                         otel_event_manager.see_event_completed_failed(&error);
 
                         let _ = tx_event.send(Err(error)).await;
+                        if let Some(tx) = usage_tx.take() {
+                            let _ = tx.send(None);
+                        }
                     }
                 }
                 return;
@@ -839,6 +836,9 @@ async fn process_sse<S>(
                         None,
                     )))
                     .await;
+                if let Some(tx) = usage_tx.take() {
+                    let _ = tx.send(None);
+                }
                 return;
             }
         };
@@ -1015,15 +1015,18 @@ async fn stream_from_fixture(
 
     let rdr = std::io::Cursor::new(content);
     let stream = ReaderStream::new(rdr).map_err(CodexErr::Io);
+    let (usage_tx, usage_rx) = oneshot::channel();
     tokio::spawn(process_sse(
         stream,
         tx_event,
         provider.stream_idle_timeout(),
         otel_event_manager,
-        None,
-        None,
+        Some(usage_tx),
     ));
-    Ok(ResponseStream { rx_event })
+    Ok(ResponseStream {
+        rx_event,
+        final_usage: Some(usage_rx),
+    })
 }
 
 fn rate_limit_regex() -> &'static Regex {
@@ -1098,7 +1101,6 @@ mod tests {
             provider.stream_idle_timeout(),
             otel_event_manager,
             None,
-            None,
         ));
 
         let mut events = Vec::new();
@@ -1135,7 +1137,6 @@ mod tests {
             tx,
             provider.stream_idle_timeout(),
             otel_event_manager,
-            None,
             None,
         ));
 
@@ -1503,7 +1504,9 @@ mod tests {
             message: Some("Rate limit reached for gpt-5 in organization org- on tokens per min (TPM): Limit 1, Used 1, Requested 19304. Please try again in 28ms. Visit https://platform.openai.com/account/rate-limits to learn more.".to_string()),
             code: Some("rate_limit_exceeded".to_string()),
             plan_type: None,
-            resets_at: None
+            resets_at: None,
+            resets_in_seconds: None,
+            tokens_consumed: None,
         };
 
         let delay = try_parse_retry_after(&err);
@@ -1517,7 +1520,9 @@ mod tests {
             message: Some("Rate limit reached for gpt-5 in organization <ORG> on tokens per min (TPM): Limit 30000, Used 6899, Requested 24050. Please try again in 1.898s. Visit https://platform.openai.com/account/rate-limits to learn more.".to_string()),
             code: Some("rate_limit_exceeded".to_string()),
             plan_type: None,
-            resets_at: None
+            resets_at: None,
+            resets_in_seconds: None,
+            tokens_consumed: None,
         };
         let delay = try_parse_retry_after(&err);
         assert_eq!(delay, Some(Duration::from_secs_f64(1.898)));
