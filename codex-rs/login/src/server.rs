@@ -14,6 +14,7 @@ use crate::pkce::PkceCodes;
 use crate::pkce::generate_pkce;
 use base64::Engine;
 use chrono::Utc;
+use codex_core::auth::AccountAuth;
 use codex_core::auth::AuthDotJson;
 use codex_core::auth::get_auth_file;
 use codex_core::default_client::originator;
@@ -531,7 +532,13 @@ pub(crate) async fn persist_tokens_async(
             tokens: Some(tokens),
             last_refresh: Some(Utc::now()),
         };
-        codex_core::auth::write_auth_json(&auth_file, &auth)
+        let mode = if auth.openai_api_key.is_some() {
+            codex_app_server_protocol::AuthMode::ApiKey
+        } else {
+            codex_app_server_protocol::AuthMode::ChatGPT
+        };
+        let account = AccountAuth::new(mode, auth);
+        codex_core::auth::write_auth_json(&auth_file, &[account])
     })
     .await
     .map_err(|e| io::Error::other(format!("persist task failed: {e}")))?

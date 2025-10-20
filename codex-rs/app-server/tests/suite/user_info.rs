@@ -8,6 +8,7 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use codex_app_server_protocol::JSONRPCResponse;
 use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::UserInfoResponse;
+use codex_core::auth::AccountAuth;
 use codex_core::auth::AuthDotJson;
 use codex_core::auth::get_auth_file;
 use codex_core::auth::write_auth_json;
@@ -39,7 +40,8 @@ async fn user_info_returns_email_from_auth_json() {
         }),
         last_refresh: None,
     };
-    write_auth_json(&auth_path, &auth).expect("write auth.json");
+    let account = AccountAuth::new(codex_app_server_protocol::AuthMode::ChatGPT, auth);
+    write_auth_json(&auth_path, &[account]).expect("write auth.json");
 
     let mut mcp = McpProcess::new(codex_home.path())
         .await
