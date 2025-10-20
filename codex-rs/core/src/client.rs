@@ -59,6 +59,7 @@ use codex_protocol::config_types::ReasoningEffort as ReasoningEffortConfig;
 use codex_protocol::config_types::ReasoningSummary as ReasoningSummaryConfig;
 use codex_protocol::models::ResponseItem;
 use std::sync::Arc;
+use uuid::Uuid;
 
 #[derive(Debug, Deserialize)]
 struct ErrorResponse {
@@ -292,7 +293,12 @@ impl ModelClient {
         task_kind: TaskKind,
     ) -> std::result::Result<ResponseStream, StreamAttemptError> {
         // Always fetch the latest auth in case a prior attempt refreshed the token.
-        let auth = auth_manager.as_ref().and_then(|m| m.auth());
+        let account_selection = auth_manager
+            .as_ref()
+            .and_then(|manager| manager.next_available(Utc::now()));
+        let auth = account_selection
+            .as_ref()
+            .map(|selection| selection.auth.clone());
 
         trace!(
             "POST to {}: {:?}",
@@ -361,11 +367,15 @@ impl ModelClient {
                         request_id: request_id.clone(),
                     })
                 });
+                let auth_manager_clone = auth_manager.clone();
+                let account_id = account_selection.as_ref().map(|selection| selection.id);
                 tokio::spawn(process_sse(
                     stream,
                     tx_event,
                     self.provider.stream_idle_timeout(),
                     self.otel_event_manager.clone(),
+                    auth_manager_clone,
+                    account_id,
                 ));
 
                 Ok(ResponseStream { rx_event })
@@ -383,9 +393,9 @@ impl ModelClient {
 
                 if status == StatusCode::UNAUTHORIZED
                     && let Some(manager) = auth_manager.as_ref()
-                    && manager.auth().is_some()
+                    && let Some(selection) = account_selection.as_ref()
                 {
-                    let _ = manager.refresh_token().await;
+                    let _ = manager.refresh_token(selection.id).await;
                 }
 
                 // The OpenAI Responses endpoint returns structured JSON bodies even for 4xx/5xx
@@ -429,11 +439,89 @@ impl ModelClient {
                             let codex_err = CodexErr::UsageLimitReached(UsageLimitReachedError {
                                 plan_type,
                                 resets_at,
-                                rate_limits: rate_limit_snapshot,
+                                rate_limits: rate_limit_snapshot.clone(),
                             });
+                            if let (Some(manager), Some(selection)) =
+                                (auth_manager.as_ref(), account_selection.as_ref())
+                            {
+                                let expires_at = error
+                                    .resets_at
+                                    .as_deref()
+                                    .and_then(|value| {
+                                        DateTime::parse_from_rfc3339(value)
+                                            .ok()
+                                            .map(|dt| dt.with_timezone(&Utc))
+                                    })
+                                    .or_else(|| {
+                                        retry_after
+                                            .and_then(|duration| {
+                                                chrono::Duration::from_std(duration).ok()
+                                            })
+                                            .map(|duration| Utc::now() + duration)
+                                    })
+                                    .unwrap_or_else(Utc::now);
+                                let tokens_since_last =
+                                    selection.tokens_since_last_cooldown.clone();
+                                if let Err(err) = manager.mark_cooldown(
+                                    selection.id,
+                                    expires_at,
+                                    error.message.clone(),
+                                    tokens_since_last,
+                                    rate_limit_snapshot.clone(),
+                                ) {
+                                    debug!("failed to record cooldown: {err:#}");
+                                }
+                            }
                             return Err(StreamAttemptError::Fatal(codex_err));
                         } else if error.r#type.as_deref() == Some("usage_not_included") {
                             return Err(StreamAttemptError::Fatal(CodexErr::UsageNotIncluded));
+                        } else if let (Some(manager), Some(selection)) =
+                            (auth_manager.as_ref(), account_selection.as_ref())
+                        {
+                            let expires_at = error
+                                .resets_at
+                                .as_deref()
+                                .and_then(|value| {
+                                    DateTime::parse_from_rfc3339(value)
+                                        .ok()
+                                        .map(|dt| dt.with_timezone(&Utc))
+                                })
+                                .or_else(|| {
+                                    retry_after
+                                        .and_then(|duration| {
+                                            chrono::Duration::from_std(duration).ok()
+                                        })
+                                        .map(|duration| Utc::now() + duration)
+                                })
+                                .unwrap_or_else(Utc::now);
+                            let tokens_since_last = selection.tokens_since_last_cooldown.clone();
+                            let reason = error.message.clone();
+                            if let Err(err) = manager.mark_cooldown(
+                                selection.id,
+                                expires_at,
+                                reason,
+                                tokens_since_last,
+                                rate_limit_snapshot.clone(),
+                            ) {
+                                debug!("failed to record cooldown: {err:#}");
+                            }
+                        }
+                    } else if let (Some(manager), Some(selection)) =
+                        (auth_manager.as_ref(), account_selection.as_ref())
+                    {
+                        let expires_at = retry_after
+                            .and_then(|duration| chrono::Duration::from_std(duration).ok())
+                            .map(|duration| Utc::now() + duration)
+                            .unwrap_or_else(Utc::now);
+                        let tokens_since_last = selection.tokens_since_last_cooldown.clone();
+                        if let Err(err) = manager.mark_cooldown(
+                            selection.id,
+                            expires_at,
+                            None,
+                            tokens_since_last,
+                            rate_limit_snapshot.clone(),
+                        ) {
+                            debug!("failed to record cooldown: {err:#}");
                         }
                     }
                 }
@@ -536,13 +624,13 @@ struct SseEvent {
     delta: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 struct ResponseCompleted {
     id: String,
     usage: Option<ResponseCompletedUsage>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 struct ResponseCompletedUsage {
     input_tokens: u64,
     input_tokens_details: Option<ResponseCompletedInputTokensDetails>,
@@ -569,12 +657,12 @@ impl From<ResponseCompletedUsage> for TokenUsage {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 struct ResponseCompletedInputTokensDetails {
     cached_tokens: u64,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 struct ResponseCompletedOutputTokensDetails {
     reasoning_tokens: u64,
 }
@@ -671,6 +759,8 @@ async fn process_sse<S>(
     tx_event: mpsc::Sender<Result<ResponseEvent>>,
     idle_timeout: Duration,
     otel_event_manager: OtelEventManager,
+    auth_manager: Option<Arc<AuthManager>>,
+    account_id: Option<Uuid>,
 ) where
     S: Stream<Item = Result<Bytes>> + Unpin,
 {
@@ -701,7 +791,7 @@ async fn process_sse<S>(
                         id: response_id,
                         usage,
                     }) => {
-                        if let Some(token_usage) = &usage {
+                        if let Some(token_usage) = usage.as_ref() {
                             otel_event_manager.sse_event_completed(
                                 token_usage.input_tokens,
                                 token_usage.output_tokens,
@@ -716,9 +806,17 @@ async fn process_sse<S>(
                                 token_usage.total_tokens,
                             );
                         }
+                        let converted_usage: Option<TokenUsage> = usage.clone().map(Into::into);
+                        if let (Some(manager), Some(account_id), Some(usage)) =
+                            (auth_manager.as_ref(), account_id, converted_usage.as_ref())
+                        {
+                            if let Err(err) = manager.register_usage(account_id, usage.clone()) {
+                                debug!("failed to record usage: {err:#}");
+                            }
+                        }
                         let event = ResponseEvent::Completed {
                             response_id,
-                            token_usage: usage.map(Into::into),
+                            token_usage: converted_usage,
                         };
                         let _ = tx_event.send(Ok(event)).await;
                     }
@@ -922,6 +1020,8 @@ async fn stream_from_fixture(
         tx_event,
         provider.stream_idle_timeout(),
         otel_event_manager,
+        None,
+        None,
     ));
     Ok(ResponseStream { rx_event })
 }
@@ -997,6 +1097,8 @@ mod tests {
             tx,
             provider.stream_idle_timeout(),
             otel_event_manager,
+            None,
+            None,
         ));
 
         let mut events = Vec::new();
@@ -1033,6 +1135,8 @@ mod tests {
             tx,
             provider.stream_idle_timeout(),
             otel_event_manager,
+            None,
+            None,
         ));
 
         let mut out = Vec::new();

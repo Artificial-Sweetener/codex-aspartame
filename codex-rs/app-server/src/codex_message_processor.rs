@@ -3,6 +3,7 @@ use crate::error_code::INVALID_REQUEST_ERROR_CODE;
 use crate::fuzzy_file_search::run_fuzzy_file_search;
 use crate::outgoing_message::OutgoingMessageSender;
 use crate::outgoing_message::OutgoingNotification;
+use chrono::Utc;
 use codex_app_server_protocol::AddConversationListenerParams;
 use codex_app_server_protocol::AddConversationSubscriptionResponse;
 use codex_app_server_protocol::ApplyPatchApprovalParams;
@@ -252,13 +253,16 @@ impl CodexMessageProcessor {
 
         match login_with_api_key(&self.config.codex_home, &params.api_key) {
             Ok(()) => {
-                self.auth_manager.reload();
+                self.auth_manager.reload(None);
                 self.outgoing
                     .send_response(request_id, LoginApiKeyResponse {})
                     .await;
 
                 let payload = AuthStatusChangeNotification {
-                    auth_method: self.auth_manager.auth().map(|auth| auth.mode),
+                    auth_method: self
+                        .auth_manager
+                        .next_available(Utc::now())
+                        .map(|selection| selection.auth.mode),
                 };
                 self.outgoing
                     .send_server_notification(ServerNotification::AuthStatusChange(payload))
@@ -341,10 +345,12 @@ impl CodexMessageProcessor {
                     // Send an auth status change notification.
                     if success {
                         // Update in-memory auth cache now that login completed.
-                        auth_manager.reload();
+                        auth_manager.reload(None);
 
                         // Notify clients with the actual current auth mode.
-                        let current_auth_method = auth_manager.auth().map(|a| a.mode);
+                        let current_auth_method = auth_manager
+                            .next_available(Utc::now())
+                            .map(|selection| selection.auth.mode);
                         let payload = AuthStatusChangeNotification {
                             auth_method: current_auth_method,
                         };
@@ -410,7 +416,18 @@ impl CodexMessageProcessor {
             }
         }
 
-        if let Err(err) = self.auth_manager.logout() {
+        let account = self.auth_manager.next_available(Utc::now());
+        let Some(selection) = account else {
+            let error = JSONRPCErrorError {
+                code: INVALID_REQUEST_ERROR_CODE,
+                message: "no account is currently logged in".to_string(),
+                data: None,
+            };
+            self.outgoing.send_error(request_id, error).await;
+            return;
+        };
+
+        if let Err(err) = self.auth_manager.logout(selection.id) {
             let error = JSONRPCErrorError {
                 code: INTERNAL_ERROR_CODE,
                 message: format!("logout failed: {err}"),
@@ -429,7 +446,10 @@ impl CodexMessageProcessor {
 
         // Send auth status change notification reflecting the current auth mode
         // after logout.
-        let current_auth_method = self.auth_manager.auth().map(|auth| auth.mode);
+        let current_auth_method = self
+            .auth_manager
+            .next_available(Utc::now())
+            .map(|auth| auth.auth.mode);
         let payload = AuthStatusChangeNotification {
             auth_method: current_auth_method,
         };
@@ -446,8 +466,13 @@ impl CodexMessageProcessor {
         let include_token = params.include_token.unwrap_or(false);
         let do_refresh = params.refresh_token.unwrap_or(false);
 
-        if do_refresh && let Err(err) = self.auth_manager.refresh_token().await {
-            tracing::warn!("failed to refresh token while getting auth status: {err}");
+        let current_account = self.auth_manager.next_available(Utc::now());
+        if do_refresh {
+            if let Some(selection) = current_account.as_ref() {
+                if let Err(err) = self.auth_manager.refresh_token(selection.id).await {
+                    tracing::warn!("failed to refresh token while getting auth status: {err}");
+                }
+            }
         }
 
         // Determine whether auth is required based on the active model provider.
@@ -462,8 +487,9 @@ impl CodexMessageProcessor {
                 requires_openai_auth: Some(false),
             }
         } else {
-            match self.auth_manager.auth() {
-                Some(auth) => {
+            match current_account {
+                Some(selection) => {
+                    let auth = selection.auth;
                     let auth_mode = auth.mode;
                     let (reported_auth_method, token_opt) = match auth.get_token().await {
                         Ok(token) if !token.is_empty() => {

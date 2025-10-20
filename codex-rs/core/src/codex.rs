@@ -532,13 +532,25 @@ impl Session {
             }
         }
 
+        let (account_id, account_email, account_mode) = auth_manager
+            .next_available(chrono::Utc::now())
+            .map(|selection| {
+                let auth = selection.auth;
+                (
+                    auth.get_account_id(),
+                    auth.get_account_email(),
+                    Some(auth.mode),
+                )
+            })
+            .unwrap_or((None, None, None));
+
         let otel_event_manager = OtelEventManager::new(
             conversation_id,
             config.model.as_str(),
             config.model_family.slug.as_str(),
-            auth_manager.auth().and_then(|a| a.get_account_id()),
-            auth_manager.auth().and_then(|a| a.get_account_email()),
-            auth_manager.auth().map(|a| a.mode),
+            account_id,
+            account_email,
+            account_mode,
             config.otel.log_user_prompt,
             terminal::user_agent(),
         );
