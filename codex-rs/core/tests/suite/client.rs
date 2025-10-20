@@ -1,3 +1,4 @@
+use base64::Engine as _;
 use codex_app_server_protocol::AuthMode;
 use codex_core::CodexAuth;
 use codex_core::ContentItem;
@@ -13,6 +14,11 @@ use codex_core::ReasoningItemContent;
 use codex_core::ResponseEvent;
 use codex_core::ResponseItem;
 use codex_core::WireApi;
+use codex_core::auth::AccountAuth;
+use codex_core::auth::AuthDotJson;
+use codex_core::auth::TokenCounters;
+use codex_core::auth::load_auth_accounts;
+use codex_core::auth::write_auth_json;
 use codex_core::built_in_model_providers;
 use codex_core::error::CodexErr;
 use codex_core::model_family::find_family_for_model;
@@ -20,6 +26,7 @@ use codex_core::protocol::EventMsg;
 use codex_core::protocol::InputItem;
 use codex_core::protocol::Op;
 use codex_core::protocol::SessionSource;
+use codex_core::token_data::TokenData;
 use codex_otel::otel_event_manager::OtelEventManager;
 use codex_protocol::ConversationId;
 use codex_protocol::models::ReasoningItemReasoningSummary;
@@ -84,7 +91,7 @@ fn assert_message_ends_with(request_body: &serde_json::Value, text: &str) {
 /// Writes an `auth.json` into the provided `codex_home` with the specified parameters.
 /// Returns the fake JWT string written to `tokens.id_token`.
 #[expect(clippy::unwrap_used)]
-fn write_auth_json(
+fn write_multi_auth_json(
     codex_home: &TempDir,
     openai_api_key: Option<&str>,
     chatgpt_plan_type: &str,
@@ -108,29 +115,152 @@ fn write_auth_json(
     let signature_b64 = b64(b"sig");
     let fake_jwt = format!("{header_b64}.{payload_b64}.{signature_b64}");
 
-    let mut tokens = json!({
-        "id_token": fake_jwt,
-        "access_token": access_token,
-        "refresh_token": "refresh-test",
-    });
-    if let Some(acc) = account_id {
-        tokens["account_id"] = json!(acc);
+    let mut token_data = TokenData {
+        id_token: codex_core::token_data::parse_id_token(&fake_jwt).unwrap(),
+        access_token: access_token.to_string(),
+        refresh_token: "refresh-test".to_string(),
+        account_id: account_id.map(|s| s.to_string()),
+    };
+    if token_data.account_id.is_none() {
+        token_data.account_id = Some("acc-123".to_string());
     }
 
-    let auth_json = json!({
-        "OPENAI_API_KEY": openai_api_key,
-        "tokens": tokens,
-        // RFC3339 datetime; value doesn't matter for these tests
-        "last_refresh": chrono::Utc::now(),
-    });
-
-    std::fs::write(
-        codex_home.path().join("auth.json"),
-        serde_json::to_string_pretty(&auth_json).unwrap(),
-    )
-    .unwrap();
+    let auth = AuthDotJson {
+        openai_api_key: openai_api_key.map(|s| s.to_string()),
+        tokens: Some(token_data),
+        last_refresh: Some(chrono::Utc::now()),
+    };
+    let mode = if openai_api_key.is_some() {
+        AuthMode::ApiKey
+    } else {
+        AuthMode::ChatGPT
+    };
+    let account = AccountAuth::new(mode, auth);
+    let auth_path = codex_home.path().join("auth.json");
+    write_auth_json(&auth_path, &[account]).unwrap();
 
     fake_jwt
+}
+
+#[test]
+fn multi_account_roundtrip_preserves_metadata() {
+    let dir = TempDir::new().unwrap();
+    let auth_path = dir.path().join("auth.json");
+    let last_refresh = chrono::Utc::now();
+    let mut counters = TokenCounters::default();
+    counters.total_input_tokens = 25;
+    counters.total_output_tokens = 75;
+    counters.total_combined_tokens = 100;
+    counters.cooldown_window_input = 10;
+    counters.cooldown_window_output = 20;
+
+    let header = json!({ "alg": "none", "typ": "JWT" });
+    let payload = json!({ "email": "primary@example.com" });
+    let b64 = |b: &[u8]| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b);
+    let header_b64 = b64(&serde_json::to_vec(&header).unwrap());
+    let payload_b64 = b64(&serde_json::to_vec(&payload).unwrap());
+    let signature_b64 = b64(b"sig");
+    let fake_jwt = format!("{header_b64}.{payload_b64}.{signature_b64}");
+
+    let mut account = AccountAuth::new(
+        AuthMode::ChatGPT,
+        AuthDotJson {
+            openai_api_key: None,
+            tokens: Some(TokenData {
+                id_token: codex_core::token_data::parse_id_token(&fake_jwt).unwrap(),
+                access_token: "access".to_string(),
+                refresh_token: "refresh".to_string(),
+                account_id: Some("acct".to_string()),
+            }),
+            last_refresh: Some(last_refresh),
+        },
+    );
+    account.label = Some("Primary".to_string());
+    account.priority = 7;
+    account.cooldown_until = Some(last_refresh + chrono::Duration::minutes(5));
+    account.last_error = Some("rate limited".to_string());
+    account.lifetime_usage = counters.clone();
+
+    write_auth_json(&auth_path, &[account.clone()]).expect("write auth.json");
+
+    let loaded = load_auth_accounts(&auth_path).expect("load accounts");
+    assert_eq!(vec![account], loaded);
+}
+
+#[test]
+fn load_auth_accounts_migrates_legacy_schema() {
+    let dir = TempDir::new().unwrap();
+    let auth_path = dir.path().join("auth.json");
+    let legacy_jwt = {
+        let header = json!({ "alg": "none", "typ": "JWT" });
+        let payload = json!({ "email": "legacy@example.com" });
+        let b64 = |b: &[u8]| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b);
+        let header_b64 = b64(&serde_json::to_vec(&header).unwrap());
+        let payload_b64 = b64(&serde_json::to_vec(&payload).unwrap());
+        let signature_b64 = b64(b"sig");
+        format!("{header_b64}.{payload_b64}.{signature_b64}")
+    };
+    let legacy = AuthDotJson {
+        openai_api_key: None,
+        tokens: Some(TokenData {
+            id_token: codex_core::token_data::parse_id_token(&legacy_jwt).unwrap(),
+            access_token: "legacy-access".to_string(),
+            refresh_token: "legacy-refresh".to_string(),
+            account_id: Some("legacy".to_string()),
+        }),
+        last_refresh: Some(chrono::Utc::now()),
+    };
+    std::fs::write(&auth_path, serde_json::to_string_pretty(&legacy).unwrap()).unwrap();
+
+    let accounts = load_auth_accounts(&auth_path).expect("load migrated accounts");
+    assert_eq!(1, accounts.len());
+    let account = &accounts[0];
+    assert_eq!(account.mode, AuthMode::ChatGPT);
+    assert_eq!(account.auth_dot_json, legacy);
+    assert_eq!(account.priority, 0);
+    assert!(account.cooldown_until.is_none());
+    assert!(account.last_error.is_none());
+    assert_eq!(account.lifetime_usage, TokenCounters::default());
+    assert!(!account.id.is_nil());
+}
+
+#[test]
+fn token_counters_are_serialized() {
+    let dir = TempDir::new().unwrap();
+    let auth_path = dir.path().join("auth.json");
+
+    let mut counters = TokenCounters::default();
+    counters.total_input_tokens = 11;
+    counters.total_output_tokens = 22;
+    counters.total_combined_tokens = 33;
+    counters.cooldown_window_input = 44;
+    counters.cooldown_window_output = 55;
+
+    let mut account = AccountAuth::new(
+        AuthMode::ChatGPT,
+        AuthDotJson {
+            openai_api_key: None,
+            tokens: None,
+            last_refresh: None,
+        },
+    );
+    account.lifetime_usage = counters.clone();
+
+    write_auth_json(&auth_path, &[account.clone()]).expect("write auth.json");
+
+    let raw = std::fs::read_to_string(&auth_path).expect("read auth.json");
+    let json: serde_json::Value = serde_json::from_str(&raw).expect("parse json");
+    assert_eq!(
+        json["accounts"][0]["lifetime_usage"]["total_input_tokens"].as_u64(),
+        Some(11)
+    );
+    assert_eq!(
+        json["accounts"][0]["lifetime_usage"]["cooldown_window_output"].as_u64(),
+        Some(55)
+    );
+
+    let loaded = load_auth_accounts(&auth_path).expect("load accounts");
+    assert_eq!(loaded[0].lifetime_usage, counters);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -513,7 +643,7 @@ async fn prefers_apikey_when_config_prefers_apikey_even_with_chatgpt_tokens() {
     let codex_home = TempDir::new().unwrap();
     // Write auth.json that contains both API key and ChatGPT tokens for a plan that should prefer ChatGPT,
     // but config will force API key preference.
-    let _jwt = write_auth_json(
+    let _jwt = write_multi_auth_json(
         &codex_home,
         Some("sk-test-key"),
         "pro",

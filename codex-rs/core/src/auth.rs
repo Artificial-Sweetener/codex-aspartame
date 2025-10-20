@@ -2,6 +2,7 @@ use chrono::DateTime;
 use chrono::Utc;
 use serde::Deserialize;
 use serde::Serialize;
+use serde_json::Value;
 use std::env;
 use std::fs::File;
 use std::fs::OpenOptions;
@@ -14,6 +15,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
+use uuid::Uuid;
 
 use codex_app_server_protocol::AuthMode;
 
@@ -25,6 +27,8 @@ use crate::token_data::parse_id_token;
 pub struct CodexAuth {
     pub mode: AuthMode,
 
+    pub(crate) account_auth_id: Option<Uuid>,
+
     pub(crate) api_key: Option<String>,
     pub(crate) auth_dot_json: Arc<Mutex<Option<AuthDotJson>>>,
     pub(crate) auth_file: PathBuf,
@@ -33,7 +37,7 @@ pub struct CodexAuth {
 
 impl PartialEq for CodexAuth {
     fn eq(&self, other: &Self) -> bool {
-        self.mode == other.mode
+        self.mode == other.mode && self.account_auth_id == other.account_auth_id
     }
 }
 
@@ -50,6 +54,7 @@ impl CodexAuth {
 
         let updated = update_tokens(
             &self.auth_file,
+            self.account_auth_id,
             refresh_response.id_token,
             refresh_response.access_token,
             refresh_response.refresh_token,
@@ -57,10 +62,10 @@ impl CodexAuth {
         .await?;
 
         if let Ok(mut auth_lock) = self.auth_dot_json.lock() {
-            *auth_lock = Some(updated.clone());
+            *auth_lock = Some(updated.auth_dot_json.clone());
         }
 
-        let access = match updated.tokens {
+        let access = match updated.auth_dot_json.tokens {
             Some(t) => t.access_token,
             None => {
                 return Err(std::io::Error::other(
@@ -95,24 +100,22 @@ impl CodexAuth {
                     })?
                     .map_err(std::io::Error::other)?;
 
-                    let updated_auth_dot_json = update_tokens(
+                    let updated_account = update_tokens(
                         &self.auth_file,
+                        self.account_auth_id,
                         refresh_response.id_token,
                         refresh_response.access_token,
                         refresh_response.refresh_token,
                     )
                     .await?;
 
-                    tokens = updated_auth_dot_json
-                        .tokens
-                        .clone()
-                        .ok_or(std::io::Error::other(
-                            "Token data is not available after refresh.",
-                        ))?;
+                    tokens = updated_account.auth_dot_json.tokens.clone().ok_or(
+                        std::io::Error::other("Token data is not available after refresh."),
+                    )?;
 
                     #[expect(clippy::unwrap_used)]
                     let mut auth_lock = self.auth_dot_json.lock().unwrap();
-                    *auth_lock = Some(updated_auth_dot_json);
+                    *auth_lock = Some(updated_account.auth_dot_json.clone());
                 }
 
                 Ok(tokens)
@@ -168,6 +171,7 @@ impl CodexAuth {
 
         let auth_dot_json = Arc::new(Mutex::new(Some(auth_dot_json)));
         Self {
+            account_auth_id: None,
             api_key: None,
             mode: AuthMode::ChatGPT,
             auth_file: PathBuf::new(),
@@ -178,6 +182,7 @@ impl CodexAuth {
 
     fn from_api_key_with_client(api_key: &str, client: reqwest::Client) -> Self {
         Self {
+            account_auth_id: None,
             api_key: Some(api_key.to_owned()),
             mode: AuthMode::ApiKey,
             auth_file: PathBuf::new(),
@@ -212,6 +217,14 @@ pub fn get_auth_file(codex_home: &Path) -> PathBuf {
     codex_home.join("auth.json")
 }
 
+fn get_multi_auth_dir(codex_home: &Path) -> PathBuf {
+    codex_home.join("multi_auth")
+}
+
+fn get_usage_log_file(codex_home: &Path) -> PathBuf {
+    get_multi_auth_dir(codex_home).join("usage_log.jsonl")
+}
+
 /// Delete the auth.json file inside `codex_home` if it exists. Returns `Ok(true)`
 /// if a file was removed, `Ok(false)` if no auth file was present.
 pub fn logout(codex_home: &Path) -> std::io::Result<bool> {
@@ -230,7 +243,8 @@ pub fn login_with_api_key(codex_home: &Path, api_key: &str) -> std::io::Result<(
         tokens: None,
         last_refresh: None,
     };
-    write_auth_json(&get_auth_file(codex_home), &auth_dot_json)
+    let account = AccountAuth::new(AuthMode::ApiKey, auth_dot_json);
+    write_auth_json(&get_auth_file(codex_home), &[account])
 }
 
 fn load_auth(
@@ -247,33 +261,24 @@ fn load_auth(
 
     let auth_file = get_auth_file(codex_home);
     let client = crate::default_client::create_client();
-    let auth_dot_json = match try_read_auth_json(&auth_file) {
-        Ok(auth) => auth,
-        Err(e) => {
-            return Err(e);
-        }
+    let accounts = load_auth_accounts(&auth_file)?;
+    let account = match accounts.into_iter().next() {
+        Some(account) => account,
+        None => return Ok(None),
     };
 
-    let AuthDotJson {
-        openai_api_key: auth_json_api_key,
-        tokens,
-        last_refresh,
-    } = auth_dot_json;
-
-    // Prefer AuthMode.ApiKey if it's set in the auth.json.
-    if let Some(api_key) = &auth_json_api_key {
-        return Ok(Some(CodexAuth::from_api_key_with_client(api_key, client)));
+    if account.mode == AuthMode::ApiKey {
+        if let Some(api_key) = &account.auth_dot_json.openai_api_key {
+            return Ok(Some(CodexAuth::from_api_key_with_client(api_key, client)));
+        }
     }
 
     Ok(Some(CodexAuth {
-        api_key: None,
-        mode: AuthMode::ChatGPT,
+        api_key: account.auth_dot_json.openai_api_key.clone(),
+        mode: account.mode,
+        account_auth_id: Some(account.id),
         auth_file,
-        auth_dot_json: Arc::new(Mutex::new(Some(AuthDotJson {
-            openai_api_key: None,
-            tokens,
-            last_refresh,
-        }))),
+        auth_dot_json: Arc::new(Mutex::new(Some(account.auth_dot_json))),
         client,
     }))
 }
@@ -281,50 +286,84 @@ fn load_auth(
 /// Attempt to read and refresh the `auth.json` file in the given `CODEX_HOME` directory.
 /// Returns the full AuthDotJson structure after refreshing if necessary.
 pub fn try_read_auth_json(auth_file: &Path) -> std::io::Result<AuthDotJson> {
-    let mut file = File::open(auth_file)?;
-    let mut contents = String::new();
-    file.read_to_string(&mut contents)?;
-    let auth_dot_json: AuthDotJson = serde_json::from_str(&contents)?;
-
-    Ok(auth_dot_json)
+    let accounts = load_auth_accounts(auth_file)?;
+    accounts
+        .into_iter()
+        .next()
+        .map(|account| account.auth_dot_json)
+        .ok_or_else(|| std::io::Error::other("auth.json contains no accounts"))
 }
 
-pub fn write_auth_json(auth_file: &Path, auth_dot_json: &AuthDotJson) -> std::io::Result<()> {
+pub fn write_auth_json(auth_file: &Path, accounts: &[AccountAuth]) -> std::io::Result<()> {
     if let Some(parent) = auth_file.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let json_data = serde_json::to_string_pretty(auth_dot_json)?;
+
+    let data = AuthAccountsFile {
+        version: AuthFileVersion::V2,
+        accounts: accounts.to_vec(),
+    };
+    let json_data = serde_json::to_string_pretty(&data)?;
+
+    let tmp_path = auth_file.with_file_name(format!(
+        "{}.tmp",
+        auth_file.file_name().unwrap().to_string_lossy()
+    ));
+
     let mut options = OpenOptions::new();
     options.truncate(true).write(true).create(true);
     #[cfg(unix)]
     {
         options.mode(0o600);
     }
-    let mut file = options.open(auth_file)?;
+    let mut file = options.open(&tmp_path)?;
     file.write_all(json_data.as_bytes())?;
     file.flush()?;
+    file.sync_all()?;
+    match std::fs::rename(&tmp_path, auth_file) {
+        Ok(()) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+            std::fs::remove_file(auth_file)?;
+            std::fs::rename(&tmp_path, auth_file)?;
+        }
+        Err(err) => return Err(err),
+    }
     Ok(())
 }
 
 async fn update_tokens(
     auth_file: &Path,
+    account_auth_id: Option<Uuid>,
     id_token: String,
     access_token: Option<String>,
     refresh_token: Option<String>,
-) -> std::io::Result<AuthDotJson> {
-    let mut auth_dot_json = try_read_auth_json(auth_file)?;
+) -> std::io::Result<AccountAuth> {
+    let account_id = account_auth_id
+        .ok_or_else(|| std::io::Error::other("account identifier is required for update"))?;
 
-    let tokens = auth_dot_json.tokens.get_or_insert_with(TokenData::default);
-    tokens.id_token = parse_id_token(&id_token).map_err(std::io::Error::other)?;
-    if let Some(access_token) = access_token {
-        tokens.access_token = access_token;
-    }
-    if let Some(refresh_token) = refresh_token {
-        tokens.refresh_token = refresh_token;
-    }
-    auth_dot_json.last_refresh = Some(Utc::now());
-    write_auth_json(auth_file, &auth_dot_json)?;
-    Ok(auth_dot_json)
+    let mut accounts = load_auth_accounts(auth_file)?;
+    let updated_account = {
+        let account = accounts
+            .iter_mut()
+            .find(|a| a.id == account_id)
+            .ok_or_else(|| std::io::Error::other("account not found"))?;
+
+        let tokens = account
+            .auth_dot_json
+            .tokens
+            .get_or_insert_with(TokenData::default);
+        tokens.id_token = parse_id_token(&id_token).map_err(std::io::Error::other)?;
+        if let Some(access_token) = access_token {
+            tokens.access_token = access_token;
+        }
+        if let Some(refresh_token) = refresh_token {
+            tokens.refresh_token = refresh_token;
+        }
+        account.auth_dot_json.last_refresh = Some(Utc::now());
+        account.clone()
+    };
+    write_auth_json(auth_file, &accounts)?;
+    Ok(updated_account)
 }
 
 async fn try_refresh_token(
@@ -394,6 +433,163 @@ pub const CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 
 use std::sync::RwLock;
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AccountAuth {
+    pub id: Uuid,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    pub mode: AuthMode,
+    pub auth_dot_json: AuthDotJson,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cooldown_until: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+    #[serde(default)]
+    pub priority: u32,
+    #[serde(default)]
+    pub lifetime_usage: TokenCounters,
+}
+
+impl AccountAuth {
+    pub fn new(mode: AuthMode, auth_dot_json: AuthDotJson) -> Self {
+        Self {
+            id: Uuid::new_v4(),
+            label: None,
+            mode,
+            auth_dot_json,
+            cooldown_until: None,
+            last_error: None,
+            priority: 0,
+            lifetime_usage: TokenCounters::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct TokenCounters {
+    pub total_input_tokens: u64,
+    pub total_output_tokens: u64,
+    pub total_combined_tokens: u64,
+    pub cooldown_window_input: u64,
+    pub cooldown_window_output: u64,
+}
+
+impl Default for TokenCounters {
+    fn default() -> Self {
+        Self {
+            total_input_tokens: 0,
+            total_output_tokens: 0,
+            total_combined_tokens: 0,
+            cooldown_window_input: 0,
+            cooldown_window_output: 0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthFileVersion {
+    V2,
+}
+
+impl AuthFileVersion {
+    fn as_u32(self) -> u32 {
+        match self {
+            AuthFileVersion::V2 => 2,
+        }
+    }
+}
+
+impl Serialize for AuthFileVersion {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_u32(self.as_u32())
+    }
+}
+
+impl<'de> Deserialize<'de> for AuthFileVersion {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = u32::deserialize(deserializer)?;
+        match value {
+            2 => Ok(AuthFileVersion::V2),
+            _ => Err(serde::de::Error::custom(format!(
+                "unsupported auth file version {value}"
+            ))),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+struct AuthAccountsFile {
+    version: AuthFileVersion,
+    #[serde(default)]
+    accounts: Vec<AccountAuth>,
+}
+
+pub fn load_auth_accounts(auth_file: &Path) -> std::io::Result<Vec<AccountAuth>> {
+    let mut file = File::open(auth_file)?;
+    let mut contents = String::new();
+    file.read_to_string(&mut contents)?;
+
+    let value: Value = serde_json::from_str(&contents)?;
+    if value.get("version").is_none() {
+        let auth_dot_json: AuthDotJson = serde_json::from_value(value)?;
+        let mode = if auth_dot_json.openai_api_key.is_some() {
+            AuthMode::ApiKey
+        } else {
+            AuthMode::ChatGPT
+        };
+        return Ok(vec![AccountAuth {
+            id: Uuid::new_v4(),
+            label: None,
+            mode,
+            auth_dot_json,
+            cooldown_until: None,
+            last_error: None,
+            priority: 0,
+            lifetime_usage: TokenCounters::default(),
+        }]);
+    }
+
+    let accounts_file: AuthAccountsFile = serde_json::from_str(&contents)?;
+    Ok(accounts_file.accounts)
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UsageLogEntry {
+    pub timestamp: DateTime<Utc>,
+    pub account_id: Uuid,
+    pub tokens_since_last_cooldown: TokenCounters,
+    pub resets_in_seconds: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub plan_type: Option<String>,
+}
+
+pub fn append_usage_log(codex_home: &Path, entry: &UsageLogEntry) -> std::io::Result<()> {
+    let log_file = get_usage_log_file(codex_home);
+    if let Some(parent) = log_file.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    let mut options = OpenOptions::new();
+    options.create(true).append(true);
+    #[cfg(unix)]
+    {
+        options.mode(0o600);
+    }
+    let mut file = options.open(&log_file)?;
+    let line = serde_json::to_string(entry)?;
+    file.write_all(line.as_bytes())?;
+    file.write_all(b"\n")?;
+    file.flush()?;
+    Ok(())
+}
+
 /// Internal cached auth state.
 #[derive(Clone, Debug)]
 struct CachedAuth {
@@ -428,7 +624,8 @@ mod tests {
 
         let file = get_auth_file(codex_home.path());
         let auth_dot_json = try_read_auth_json(&file).unwrap();
-        write_auth_json(&file, &auth_dot_json).unwrap();
+        let account = AccountAuth::new(AuthMode::ChatGPT, auth_dot_json.clone());
+        write_auth_json(&file, &[account]).unwrap();
 
         let same_auth_dot_json = try_read_auth_json(&file).unwrap();
         assert_eq!(auth_dot_json, same_auth_dot_json);
@@ -532,7 +729,8 @@ mod tests {
             tokens: None,
             last_refresh: None,
         };
-        write_auth_json(&get_auth_file(dir.path()), &auth_dot_json)?;
+        let account = AccountAuth::new(AuthMode::ApiKey, auth_dot_json);
+        write_auth_json(&get_auth_file(dir.path()), &[account])?;
         assert!(dir.path().join("auth.json").exists());
         let removed = logout(dir.path())?;
         assert!(removed);
@@ -582,8 +780,15 @@ mod tests {
             },
             "last_refresh": LAST_REFRESH,
         });
-        let auth_json = serde_json::to_string_pretty(&auth_json_data)?;
-        std::fs::write(auth_file, auth_json)?;
+        let auth: AuthDotJson =
+            serde_json::from_value(auth_json_data).map_err(std::io::Error::other)?;
+        let mode = if params.openai_api_key.is_some() {
+            AuthMode::ApiKey
+        } else {
+            AuthMode::ChatGPT
+        };
+        let account = AccountAuth::new(mode, auth);
+        write_auth_json(&auth_file, &[account])?;
         Ok(fake_jwt)
     }
 }
