@@ -834,6 +834,7 @@ dependencies = [
  "app_test_support",
  "assert_cmd",
  "base64",
+ "chrono",
  "codex-app-server-protocol",
  "codex-arg0",
  "codex-common",

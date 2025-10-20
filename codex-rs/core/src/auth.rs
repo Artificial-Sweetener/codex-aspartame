@@ -3,6 +3,7 @@ use chrono::Utc;
 use serde::Deserialize;
 use serde::Serialize;
 use serde_json::Value;
+use std::cmp::Ordering;
 use std::env;
 use std::fs::File;
 use std::fs::OpenOptions;
@@ -19,6 +20,9 @@ use uuid::Uuid;
 
 use codex_app_server_protocol::AuthMode;
 
+use crate::protocol::RateLimitSnapshot;
+use crate::protocol::RateLimitWindow;
+use crate::protocol::TokenUsage;
 use crate::token_data::PlanType;
 use crate::token_data::TokenData;
 use crate::token_data::parse_id_token;
@@ -251,36 +255,8 @@ fn load_auth(
     codex_home: &Path,
     enable_codex_api_key_env: bool,
 ) -> std::io::Result<Option<CodexAuth>> {
-    if enable_codex_api_key_env && let Some(api_key) = read_codex_api_key_from_env() {
-        let client = crate::default_client::create_client();
-        return Ok(Some(CodexAuth::from_api_key_with_client(
-            api_key.as_str(),
-            client,
-        )));
-    }
-
-    let auth_file = get_auth_file(codex_home);
-    let client = crate::default_client::create_client();
-    let accounts = load_auth_accounts(&auth_file)?;
-    let account = match accounts.into_iter().next() {
-        Some(account) => account,
-        None => return Ok(None),
-    };
-
-    if account.mode == AuthMode::ApiKey {
-        if let Some(api_key) = &account.auth_dot_json.openai_api_key {
-            return Ok(Some(CodexAuth::from_api_key_with_client(api_key, client)));
-        }
-    }
-
-    Ok(Some(CodexAuth {
-        api_key: account.auth_dot_json.openai_api_key.clone(),
-        mode: account.mode,
-        account_auth_id: Some(account.id),
-        auth_file,
-        auth_dot_json: Arc::new(Mutex::new(Some(account.auth_dot_json))),
-        client,
-    }))
+    let accounts = load_account_states(codex_home, enable_codex_api_key_env)?;
+    Ok(accounts.into_iter().next().map(|state| state.auth))
 }
 
 /// Attempt to read and refresh the `auth.json` file in the given `CODEX_HOME` directory.
@@ -487,6 +463,290 @@ impl Default for TokenCounters {
     }
 }
 
+impl TokenCounters {
+    fn add_lifetime_usage(&mut self, usage: &TokenUsage) {
+        self.total_input_tokens = self.total_input_tokens.saturating_add(usage.input_tokens);
+        self.total_output_tokens = self.total_output_tokens.saturating_add(usage.output_tokens);
+        self.total_combined_tokens = self
+            .total_combined_tokens
+            .saturating_add(usage.total_tokens);
+    }
+
+    fn set_cooldown_window(&mut self, usage: &TokenUsage) {
+        self.cooldown_window_input = usage.input_tokens;
+        self.cooldown_window_output = usage.output_tokens;
+    }
+}
+
+fn add_usage(lhs: &mut TokenUsage, rhs: &TokenUsage) {
+    lhs.input_tokens = lhs.input_tokens.saturating_add(rhs.input_tokens);
+    lhs.cached_input_tokens = lhs
+        .cached_input_tokens
+        .saturating_add(rhs.cached_input_tokens);
+    lhs.output_tokens = lhs.output_tokens.saturating_add(rhs.output_tokens);
+    lhs.reasoning_output_tokens = lhs
+        .reasoning_output_tokens
+        .saturating_add(rhs.reasoning_output_tokens);
+    lhs.total_tokens = lhs.total_tokens.saturating_add(rhs.total_tokens);
+}
+
+fn subtract_usage(lhs: &TokenUsage, rhs: &TokenUsage) -> TokenUsage {
+    TokenUsage {
+        input_tokens: lhs.input_tokens.saturating_sub(rhs.input_tokens),
+        cached_input_tokens: lhs
+            .cached_input_tokens
+            .saturating_sub(rhs.cached_input_tokens),
+        output_tokens: lhs.output_tokens.saturating_sub(rhs.output_tokens),
+        reasoning_output_tokens: lhs
+            .reasoning_output_tokens
+            .saturating_sub(rhs.reasoning_output_tokens),
+        total_tokens: lhs.total_tokens.saturating_sub(rhs.total_tokens),
+    }
+}
+
+fn usage_to_counters(usage: &TokenUsage) -> TokenCounters {
+    let mut counters = TokenCounters::default();
+    counters.total_input_tokens = usage.input_tokens;
+    counters.total_output_tokens = usage.output_tokens;
+    counters.total_combined_tokens = usage.total_tokens;
+    counters.cooldown_window_input = usage.input_tokens;
+    counters.cooldown_window_output = usage.output_tokens;
+    counters
+}
+
+fn usage_equals(lhs: &TokenUsage, rhs: &TokenUsage) -> bool {
+    lhs.input_tokens == rhs.input_tokens
+        && lhs.cached_input_tokens == rhs.cached_input_tokens
+        && lhs.output_tokens == rhs.output_tokens
+        && lhs.reasoning_output_tokens == rhs.reasoning_output_tokens
+        && lhs.total_tokens == rhs.total_tokens
+}
+
+fn snapshot_equals(lhs: &Option<RateLimitSnapshot>, rhs: &Option<RateLimitSnapshot>) -> bool {
+    match (lhs, rhs) {
+        (None, None) => true,
+        (Some(left), Some(right)) => {
+            rate_limit_window_equals(&left.primary, &right.primary)
+                && rate_limit_window_equals(&left.secondary, &right.secondary)
+        }
+        _ => false,
+    }
+}
+
+fn rate_limit_window_equals(lhs: &Option<RateLimitWindow>, rhs: &Option<RateLimitWindow>) -> bool {
+    match (lhs, rhs) {
+        (None, None) => true,
+        (Some(left), Some(right)) => {
+            (left.used_percent - right.used_percent).abs() < f64::EPSILON
+                && left.window_minutes == right.window_minutes
+                && left.resets_at == right.resets_at
+        }
+        _ => false,
+    }
+}
+
+fn lock_poisoned() -> std::io::Error {
+    std::io::Error::other("auth cache lock poisoned")
+}
+
+#[derive(Clone, Debug)]
+struct AccountState {
+    id: Uuid,
+    label: Option<String>,
+    mode: AuthMode,
+    auth: CodexAuth,
+    cooldown_until: Option<DateTime<Utc>>,
+    last_error: Option<String>,
+    priority: u32,
+    lifetime_usage: TokenCounters,
+    tokens_since_last_cooldown: TokenUsage,
+    last_refresh: Option<DateTime<Utc>>,
+    usage_snapshot: Option<RateLimitSnapshot>,
+    persisted: bool,
+    cached_auth_dot_json: Option<AuthDotJson>,
+}
+
+impl AccountState {
+    fn new(codex_home: &Path, mut account: AccountAuth, persisted: bool) -> std::io::Result<Self> {
+        let auth_file = get_auth_file(codex_home);
+        let client = crate::default_client::create_client();
+        let auth = if account.mode == AuthMode::ApiKey {
+            if let Some(api_key) = &account.auth_dot_json.openai_api_key {
+                CodexAuth::from_api_key_with_client(api_key, client)
+            } else {
+                return Err(std::io::Error::other("API key account missing key"));
+            }
+        } else {
+            CodexAuth {
+                api_key: account.auth_dot_json.openai_api_key.clone(),
+                mode: account.mode,
+                account_auth_id: Some(account.id),
+                auth_file,
+                auth_dot_json: Arc::new(Mutex::new(Some(account.auth_dot_json.clone()))),
+                client,
+            }
+        };
+
+        let tokens_since_last_cooldown = TokenUsage {
+            input_tokens: account.lifetime_usage.cooldown_window_input,
+            output_tokens: account.lifetime_usage.cooldown_window_output,
+            total_tokens: account
+                .lifetime_usage
+                .cooldown_window_input
+                .saturating_add(account.lifetime_usage.cooldown_window_output),
+            ..TokenUsage::default()
+        };
+
+        let last_refresh = account.auth_dot_json.last_refresh;
+        let cached_auth_dot_json = Some(account.auth_dot_json.clone());
+        let lifetime_usage = account.lifetime_usage.clone();
+        let label = account.label.take();
+        let last_error = account.last_error.take();
+        let cooldown_until = account.cooldown_until;
+        let priority = account.priority;
+        let mode = account.mode;
+        let id = account.id;
+
+        Ok(Self {
+            id,
+            label,
+            mode,
+            auth,
+            cooldown_until,
+            last_error,
+            priority,
+            lifetime_usage,
+            tokens_since_last_cooldown,
+            last_refresh,
+            usage_snapshot: None,
+            persisted,
+            cached_auth_dot_json,
+        })
+    }
+
+    fn new_from_api_key(api_key: String) -> Self {
+        let client = crate::default_client::create_client();
+        let auth = CodexAuth::from_api_key_with_client(&api_key, client);
+        Self {
+            id: Uuid::new_v4(),
+            label: None,
+            mode: AuthMode::ApiKey,
+            auth,
+            cooldown_until: None,
+            last_error: None,
+            priority: 0,
+            lifetime_usage: TokenCounters::default(),
+            tokens_since_last_cooldown: TokenUsage::default(),
+            last_refresh: None,
+            usage_snapshot: None,
+            persisted: false,
+            cached_auth_dot_json: Some(AuthDotJson {
+                openai_api_key: Some(api_key),
+                tokens: None,
+                last_refresh: None,
+            }),
+        }
+    }
+
+    fn summary(&self) -> AccountSummary {
+        AccountSummary {
+            id: self.id,
+            label: self.label.clone(),
+            mode: self.mode,
+            cooldown_until: self.cooldown_until,
+            last_error: self.last_error.clone(),
+            last_refresh: self.last_refresh,
+            lifetime_usage: self.lifetime_usage.clone(),
+            tokens_since_last_cooldown: self.tokens_since_last_cooldown.clone(),
+            usage_snapshot: self.usage_snapshot.clone(),
+        }
+    }
+
+    fn selection(&self) -> AccountSelection {
+        AccountSelection {
+            id: self.id,
+            auth: self.auth.clone(),
+            cooldown_until: self.cooldown_until,
+            last_refresh: self.last_refresh,
+            usage_snapshot: self.usage_snapshot.clone(),
+            tokens_since_last_cooldown: self.tokens_since_last_cooldown.clone(),
+        }
+    }
+
+    fn apply_usage(&mut self, usage: &TokenUsage) {
+        self.lifetime_usage.add_lifetime_usage(usage);
+        add_usage(&mut self.tokens_since_last_cooldown, usage);
+    }
+
+    fn current_auth_dot_json(&self) -> Option<AuthDotJson> {
+        self.auth
+            .get_current_auth_json()
+            .or_else(|| self.cached_auth_dot_json.clone())
+    }
+
+    fn to_account_auth(&mut self) -> Option<AccountAuth> {
+        if !self.persisted {
+            return None;
+        }
+        let auth_dot_json = self.current_auth_dot_json()?;
+        self.last_refresh = auth_dot_json.last_refresh;
+        self.cached_auth_dot_json = Some(auth_dot_json.clone());
+        Some(AccountAuth {
+            id: self.id,
+            label: self.label.clone(),
+            mode: self.mode,
+            auth_dot_json,
+            cooldown_until: self.cooldown_until,
+            last_error: self.last_error.clone(),
+            priority: self.priority,
+            lifetime_usage: self.lifetime_usage.clone(),
+        })
+    }
+}
+
+impl PartialEq for AccountState {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id
+            && self.label == other.label
+            && self.mode == other.mode
+            && self.cooldown_until == other.cooldown_until
+            && self.last_error == other.last_error
+            && self.priority == other.priority
+            && self.lifetime_usage == other.lifetime_usage
+            && usage_equals(
+                &self.tokens_since_last_cooldown,
+                &other.tokens_since_last_cooldown,
+            )
+            && self.last_refresh == other.last_refresh
+            && snapshot_equals(&self.usage_snapshot, &other.usage_snapshot)
+            && self.persisted == other.persisted
+            && self.auth == other.auth
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct AccountSummary {
+    pub id: Uuid,
+    pub label: Option<String>,
+    pub mode: AuthMode,
+    pub cooldown_until: Option<DateTime<Utc>>,
+    pub last_error: Option<String>,
+    pub last_refresh: Option<DateTime<Utc>>,
+    pub lifetime_usage: TokenCounters,
+    pub tokens_since_last_cooldown: TokenUsage,
+    pub usage_snapshot: Option<RateLimitSnapshot>,
+}
+
+#[derive(Clone, Debug)]
+pub struct AccountSelection {
+    pub id: Uuid,
+    pub auth: CodexAuth,
+    pub cooldown_until: Option<DateTime<Utc>>,
+    pub last_refresh: Option<DateTime<Utc>>,
+    pub usage_snapshot: Option<RateLimitSnapshot>,
+    pub tokens_since_last_cooldown: TokenUsage,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AuthFileVersion {
     V2,
@@ -567,6 +827,10 @@ pub struct UsageLogEntry {
     pub tokens_since_last_cooldown: TokenCounters,
     pub resets_in_seconds: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub usage_snapshot: Option<RateLimitSnapshot>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub plan_type: Option<String>,
 }
 
@@ -590,10 +854,55 @@ pub fn append_usage_log(codex_home: &Path, entry: &UsageLogEntry) -> std::io::Re
     Ok(())
 }
 
+fn load_account_states(
+    codex_home: &Path,
+    enable_codex_api_key_env: bool,
+) -> std::io::Result<Vec<AccountState>> {
+    let mut accounts = Vec::new();
+    if enable_codex_api_key_env {
+        if let Some(api_key) = read_codex_api_key_from_env() {
+            accounts.push(AccountState::new_from_api_key(api_key));
+        }
+    }
+
+    let auth_file = get_auth_file(codex_home);
+    match load_auth_accounts(&auth_file) {
+        Ok(on_disk_accounts) => {
+            for account in on_disk_accounts {
+                accounts.push(AccountState::new(codex_home, account, true)?);
+            }
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => return Err(err),
+    }
+
+    sort_accounts(&mut accounts);
+
+    Ok(accounts)
+}
+
+fn sort_accounts(accounts: &mut Vec<AccountState>) {
+    accounts.sort_by(|a, b| {
+        let persisted_cmp = b.persisted.cmp(&a.persisted);
+        if persisted_cmp != Ordering::Equal {
+            return persisted_cmp;
+        }
+        let priority_cmp = a.priority.cmp(&b.priority);
+        if priority_cmp != Ordering::Equal {
+            return priority_cmp;
+        }
+        let label_cmp = a.label.cmp(&b.label);
+        if label_cmp != Ordering::Equal {
+            return label_cmp;
+        }
+        a.id.cmp(&b.id)
+    });
+}
+
 /// Internal cached auth state.
 #[derive(Clone, Debug)]
 struct CachedAuth {
-    auth: Option<CodexAuth>,
+    accounts: Vec<AccountState>,
 }
 
 #[cfg(test)]
@@ -602,10 +911,14 @@ mod tests {
     use crate::token_data::IdTokenInfo;
     use crate::token_data::KnownPlan;
     use crate::token_data::PlanType;
+    use crate::token_data::parse_id_token;
     use base64::Engine;
+    use chrono::Duration as ChronoDuration;
+    use futures::future::join_all;
     use pretty_assertions::assert_eq;
     use serde::Serialize;
     use serde_json::json;
+    use std::sync::Arc;
     use tempfile::tempdir;
 
     const LAST_REFRESH: &str = "2025-08-06T20:41:36.232376Z";
@@ -743,9 +1056,7 @@ mod tests {
         chatgpt_plan_type: String,
     }
 
-    fn write_auth_file(params: AuthFileParams, codex_home: &Path) -> std::io::Result<String> {
-        let auth_file = get_auth_file(codex_home);
-        // Create a minimal valid JWT for the id_token field.
+    fn generate_fake_jwt(chatgpt_plan_type: &str) -> String {
         #[derive(Serialize)]
         struct Header {
             alg: &'static str,
@@ -760,17 +1071,21 @@ mod tests {
             "email_verified": true,
             "https://api.openai.com/auth": {
                 "chatgpt_account_id": "bc3618e3-489d-4d49-9362-1561dc53ba53",
-                "chatgpt_plan_type": params.chatgpt_plan_type,
+                "chatgpt_plan_type": chatgpt_plan_type,
                 "chatgpt_user_id": "user-12345",
                 "user_id": "user-12345",
             }
         });
         let b64 = |b: &[u8]| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b);
-        let header_b64 = b64(&serde_json::to_vec(&header)?);
-        let payload_b64 = b64(&serde_json::to_vec(&payload)?);
+        let header_b64 = b64(&serde_json::to_vec(&header).expect("serialize header"));
+        let payload_b64 = b64(&serde_json::to_vec(&payload).expect("serialize payload"));
         let signature_b64 = b64(b"sig");
-        let fake_jwt = format!("{header_b64}.{payload_b64}.{signature_b64}");
+        format!("{header_b64}.{payload_b64}.{signature_b64}")
+    }
 
+    fn write_auth_file(params: AuthFileParams, codex_home: &Path) -> std::io::Result<String> {
+        let auth_file = get_auth_file(codex_home);
+        let fake_jwt = generate_fake_jwt(&params.chatgpt_plan_type);
         let auth_json_data = json!({
             "OPENAI_API_KEY": params.openai_api_key,
             "tokens": {
@@ -790,6 +1105,128 @@ mod tests {
         let account = AccountAuth::new(mode, auth);
         write_auth_json(&auth_file, &[account])?;
         Ok(fake_jwt)
+    }
+
+    fn create_test_account(account_id: &str, priority: u32) -> AccountAuth {
+        let mut token_data = TokenData::default();
+        let fake_jwt = generate_fake_jwt("pro");
+        token_data.id_token = parse_id_token(&fake_jwt).expect("fake jwt");
+        token_data.access_token = format!("access-{account_id}");
+        token_data.refresh_token = format!("refresh-{account_id}");
+        token_data.account_id = Some(account_id.to_string());
+
+        let auth_dot_json = AuthDotJson {
+            openai_api_key: None,
+            tokens: Some(token_data),
+            last_refresh: Some(Utc::now()),
+        };
+
+        let mut account = AccountAuth::new(AuthMode::ChatGPT, auth_dot_json);
+        account.priority = priority;
+        account
+    }
+
+    fn create_manager_with_accounts(
+        accounts: Vec<AccountAuth>,
+    ) -> (tempfile::TempDir, Arc<AuthManager>, Vec<Uuid>) {
+        let dir = tempdir().unwrap();
+        let auth_path = get_auth_file(dir.path());
+        let account_ids: Vec<Uuid> = accounts.iter().map(|account| account.id).collect();
+        write_auth_json(&auth_path, &accounts).expect("write auth.json");
+        let manager = Arc::new(AuthManager::new(dir.path().to_path_buf(), false));
+        (dir, manager, account_ids)
+    }
+
+    #[tokio::test]
+    async fn next_available_skips_accounts_on_cooldown() {
+        let accounts = vec![
+            create_test_account("primary", 0),
+            create_test_account("secondary", 1),
+        ];
+        let (_dir, manager, ids) = create_manager_with_accounts(accounts);
+        let first_id = ids[0];
+        let second_id = ids[1];
+
+        manager
+            .mark_cooldown(
+                first_id,
+                Utc::now() + ChronoDuration::minutes(5),
+                Some("rate limited".to_string()),
+                TokenUsage::default(),
+                None,
+            )
+            .expect("mark cooldown");
+
+        let tasks: Vec<_> = (0..8)
+            .map(|_| {
+                let manager = Arc::clone(&manager);
+                tokio::spawn(async move {
+                    manager
+                        .next_available(Utc::now())
+                        .map(|selection| selection.id)
+                })
+            })
+            .collect();
+
+        let results = join_all(tasks).await;
+        for handle in results {
+            let id = handle.expect("task failed");
+            assert_eq!(Some(second_id), id);
+        }
+    }
+
+    #[tokio::test]
+    async fn register_usage_accumulates_across_tasks() {
+        let accounts = vec![create_test_account("primary", 0)];
+        let (_dir, manager, ids) = create_manager_with_accounts(accounts);
+        let account_id = ids[0];
+
+        let usages = vec![
+            TokenUsage {
+                input_tokens: 10,
+                output_tokens: 5,
+                total_tokens: 15,
+                ..TokenUsage::default()
+            },
+            TokenUsage {
+                input_tokens: 7,
+                output_tokens: 3,
+                total_tokens: 10,
+                ..TokenUsage::default()
+            },
+            TokenUsage {
+                input_tokens: 2,
+                output_tokens: 8,
+                total_tokens: 10,
+                ..TokenUsage::default()
+            },
+        ];
+
+        let tasks: Vec<_> = usages
+            .into_iter()
+            .map(|usage| {
+                let manager = Arc::clone(&manager);
+                tokio::spawn(async move {
+                    manager
+                        .register_usage(account_id, usage)
+                        .expect("register usage");
+                })
+            })
+            .collect();
+
+        for handle in tasks {
+            handle.await.expect("usage task");
+        }
+
+        let summary = manager.accounts();
+        let account_summary = summary
+            .into_iter()
+            .find(|summary| summary.id == account_id)
+            .expect("account summary");
+        assert_eq!(19, account_summary.lifetime_usage.total_input_tokens);
+        assert_eq!(16, account_summary.lifetime_usage.total_output_tokens);
+        assert_eq!(35, account_summary.lifetime_usage.total_combined_tokens);
+        assert_eq!(35, account_summary.tokens_since_last_cooldown.total_tokens);
     }
 }
 
@@ -814,19 +1251,39 @@ impl AuthManager {
     /// simply return `None` in that case so callers can treat it as an
     /// unauthenticated state.
     pub fn new(codex_home: PathBuf, enable_codex_api_key_env: bool) -> Self {
-        let auth = load_auth(&codex_home, enable_codex_api_key_env)
-            .ok()
-            .flatten();
+        let accounts =
+            load_account_states(&codex_home, enable_codex_api_key_env).unwrap_or_default();
         Self {
             codex_home,
-            inner: RwLock::new(CachedAuth { auth }),
+            inner: RwLock::new(CachedAuth { accounts }),
             enable_codex_api_key_env,
         }
     }
 
     /// Create an AuthManager with a specific CodexAuth, for testing only.
     pub fn from_auth_for_testing(auth: CodexAuth) -> Arc<Self> {
-        let cached = CachedAuth { auth: Some(auth) };
+        let mut state = AccountState {
+            id: auth.account_auth_id.unwrap_or_else(Uuid::new_v4),
+            label: None,
+            mode: auth.mode,
+            auth,
+            cooldown_until: None,
+            last_error: None,
+            priority: 0,
+            lifetime_usage: TokenCounters::default(),
+            tokens_since_last_cooldown: TokenUsage::default(),
+            last_refresh: None,
+            usage_snapshot: None,
+            persisted: false,
+            cached_auth_dot_json: None,
+        };
+        if let Some(auth_dot_json) = state.auth.get_current_auth_json() {
+            state.last_refresh = auth_dot_json.last_refresh;
+            state.cached_auth_dot_json = Some(auth_dot_json);
+        }
+        let cached = CachedAuth {
+            accounts: vec![state],
+        };
         Arc::new(Self {
             codex_home: PathBuf::new(),
             inner: RwLock::new(cached),
@@ -836,48 +1293,172 @@ impl AuthManager {
 
     /// Current cached auth (clone). May be `None` if not logged in or load failed.
     pub fn auth(&self) -> Option<CodexAuth> {
-        self.inner.read().ok().and_then(|c| c.auth.clone())
+        self.next_available(Utc::now())
+            .map(|selection| selection.auth)
+    }
+
+    /// Snapshot of known account metadata, suitable for CLI/TUI display.
+    pub fn accounts(&self) -> Vec<AccountSummary> {
+        self.inner
+            .read()
+            .map(|guard| guard.accounts.iter().map(AccountState::summary).collect())
+            .unwrap_or_default()
+    }
+
+    /// Select the next available account whose cooldown has expired.
+    pub fn next_available(&self, now: DateTime<Utc>) -> Option<AccountSelection> {
+        self.inner.read().ok().and_then(|guard| {
+            guard
+                .accounts
+                .iter()
+                .find(|account| account.cooldown_until.map_or(true, |c| c <= now))
+                .map(AccountState::selection)
+        })
     }
 
     /// Force a reload of the auth information from auth.json. Returns
-    /// whether the auth value changed.
-    pub fn reload(&self) -> bool {
-        let new_auth = load_auth(&self.codex_home, self.enable_codex_api_key_env)
-            .ok()
-            .flatten();
-        if let Ok(mut guard) = self.inner.write() {
-            let changed = !AuthManager::auths_equal(&guard.auth, &new_auth);
-            guard.auth = new_auth;
-            changed
+    /// whether the auth value changed. When `account_id` is `Some`, only that
+    /// account is reloaded.
+    pub fn reload(&self, account_id: Option<Uuid>) -> bool {
+        if let Some(id) = account_id {
+            let loaded = load_account_states(&self.codex_home, self.enable_codex_api_key_env)
+                .ok()
+                .and_then(|accounts| accounts.into_iter().find(|a| a.id == id));
+            if let Ok(mut guard) = self.inner.write() {
+                let mut changed = false;
+                match (
+                    guard.accounts.iter().position(|account| account.id == id),
+                    loaded,
+                ) {
+                    (Some(idx), Some(state)) => {
+                        if guard.accounts[idx] != state {
+                            guard.accounts[idx] = state;
+                            changed = true;
+                        }
+                    }
+                    (Some(idx), None) => {
+                        guard.accounts.remove(idx);
+                        changed = true;
+                    }
+                    (None, Some(state)) => {
+                        guard.accounts.push(state);
+                        changed = true;
+                    }
+                    (None, None) => {}
+                }
+                if changed {
+                    sort_accounts(&mut guard.accounts);
+                }
+                changed
+            } else {
+                false
+            }
         } else {
-            false
+            let accounts = load_account_states(&self.codex_home, self.enable_codex_api_key_env)
+                .unwrap_or_default();
+            if let Ok(mut guard) = self.inner.write() {
+                let changed = guard.accounts != accounts;
+                guard.accounts = accounts;
+                changed
+            } else {
+                false
+            }
         }
     }
 
-    fn auths_equal(a: &Option<CodexAuth>, b: &Option<CodexAuth>) -> bool {
-        match (a, b) {
-            (None, None) => true,
-            (Some(a), Some(b)) => a == b,
-            _ => false,
-        }
+    /// Record a cooldown for the given account.
+    pub fn mark_cooldown(
+        &self,
+        id: Uuid,
+        expires_at: DateTime<Utc>,
+        reason: Option<String>,
+        tokens_used_since_last: TokenUsage,
+        usage_snapshot: Option<RateLimitSnapshot>,
+    ) -> std::io::Result<()> {
+        let mut guard = self.inner.write().map_err(|_| lock_poisoned())?;
+        let plan_type = {
+            let account = guard
+                .accounts
+                .iter_mut()
+                .find(|account| account.id == id)
+                .ok_or_else(|| std::io::Error::other("account not found"))?;
+
+            let recorded = account.tokens_since_last_cooldown.clone();
+            let missing = subtract_usage(&tokens_used_since_last, &recorded);
+            if missing.total_tokens > 0
+                || missing.input_tokens > 0
+                || missing.output_tokens > 0
+                || missing.cached_input_tokens > 0
+                || missing.reasoning_output_tokens > 0
+            {
+                account.apply_usage(&missing);
+            }
+
+            account
+                .lifetime_usage
+                .set_cooldown_window(&tokens_used_since_last);
+            account.tokens_since_last_cooldown = TokenUsage::default();
+            account.cooldown_until = Some(expires_at);
+            account.last_error = reason.clone();
+            account.usage_snapshot = usage_snapshot.clone();
+
+            account.auth.get_plan_type().map(|plan| match plan {
+                PlanType::Known(plan) => format!("{plan:?}"),
+                PlanType::Unknown(raw) => raw,
+            })
+        };
+
+        self.persist_accounts(&mut guard.accounts)?;
+
+        let now = Utc::now();
+        let resets_in_seconds = if expires_at > now {
+            (expires_at - now).num_seconds().max(0) as u64
+        } else {
+            0
+        };
+        let entry = UsageLogEntry {
+            timestamp: now,
+            account_id: id,
+            tokens_since_last_cooldown: usage_to_counters(&tokens_used_since_last),
+            resets_in_seconds,
+            reason,
+            usage_snapshot,
+            plan_type,
+        };
+        append_usage_log(&self.codex_home, &entry)?;
+        Ok(())
     }
 
-    /// Convenience constructor returning an `Arc` wrapper.
-    pub fn shared(codex_home: PathBuf, enable_codex_api_key_env: bool) -> Arc<Self> {
-        Arc::new(Self::new(codex_home, enable_codex_api_key_env))
+    /// Increment token usage counters for the given account.
+    pub fn register_usage(&self, id: Uuid, usage: TokenUsage) -> std::io::Result<()> {
+        let mut guard = self.inner.write().map_err(|_| lock_poisoned())?;
+        let account = guard
+            .accounts
+            .iter_mut()
+            .find(|account| account.id == id)
+            .ok_or_else(|| std::io::Error::other("account not found"))?;
+        account.apply_usage(&usage);
+        self.persist_accounts(&mut guard.accounts)
     }
 
     /// Attempt to refresh the current auth token (if any). On success, reload
     /// the auth state from disk so other components observe refreshed token.
-    pub async fn refresh_token(&self) -> std::io::Result<Option<String>> {
-        let auth = match self.auth() {
-            Some(a) => a,
-            None => return Ok(None),
+    pub async fn refresh_token(&self, id: Uuid) -> std::io::Result<Option<String>> {
+        let auth = {
+            let guard = self.inner.read().map_err(|_| lock_poisoned())?;
+            guard
+                .accounts
+                .iter()
+                .find(|account| account.id == id)
+                .map(|account| account.auth.clone())
+        };
+        let Some(auth) = auth else {
+            return Ok(None);
         };
         match auth.refresh_token().await {
             Ok(token) => {
                 // Reload to pick up persisted changes.
-                self.reload();
+                self.reload(Some(id));
                 Ok(Some(token))
             }
             Err(e) => Err(e),
@@ -888,10 +1469,60 @@ impl AuthManager {
     /// if a file was removed, Ok(false) if no auth file existed. On success,
     /// reloads the in‑memory auth cache so callers immediately observe the
     /// unauthenticated state.
-    pub fn logout(&self) -> std::io::Result<bool> {
-        let removed = super::auth::logout(&self.codex_home)?;
-        // Always reload to clear any cached auth (even if file absent).
-        self.reload();
-        Ok(removed)
+    pub fn logout(&self, id: Uuid) -> std::io::Result<bool> {
+        let mut guard = self.inner.write().map_err(|_| lock_poisoned())?;
+        let len_before = guard.accounts.len();
+        let mut removed_persisted = false;
+        guard.accounts.retain(|account| {
+            let keep = account.id != id;
+            if !keep {
+                removed_persisted = account.persisted;
+            }
+            keep
+        });
+        if len_before == guard.accounts.len() {
+            return Ok(false);
+        }
+
+        if removed_persisted {
+            self.persist_accounts(&mut guard.accounts)?;
+        } else if guard.accounts.iter().any(|account| account.persisted) {
+            self.persist_accounts(&mut guard.accounts)?;
+        } else {
+            let auth_file = get_auth_file(&self.codex_home);
+            if let Err(err) = std::fs::remove_file(&auth_file) {
+                if err.kind() != std::io::ErrorKind::NotFound {
+                    return Err(err);
+                }
+            }
+        }
+
+        Ok(true)
+    }
+
+    /// Convenience constructor returning an `Arc` wrapper.
+    pub fn shared(codex_home: PathBuf, enable_codex_api_key_env: bool) -> Arc<Self> {
+        Arc::new(Self::new(codex_home, enable_codex_api_key_env))
+    }
+
+    fn persist_accounts(&self, accounts: &mut [AccountState]) -> std::io::Result<()> {
+        let mut persisted = Vec::new();
+        for account in accounts.iter_mut() {
+            if let Some(account_auth) = account.to_account_auth() {
+                persisted.push(account_auth);
+            }
+        }
+
+        let auth_file = get_auth_file(&self.codex_home);
+        if persisted.is_empty() {
+            if let Err(err) = std::fs::remove_file(&auth_file) {
+                if err.kind() != std::io::ErrorKind::NotFound {
+                    return Err(err);
+                }
+            }
+            return Ok(());
+        }
+
+        write_auth_json(&auth_file, &persisted)
     }
 }

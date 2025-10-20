@@ -458,7 +458,7 @@ impl AuthModeWidget {
             Ok(()) => {
                 self.error = None;
                 self.login_status = LoginStatus::AuthMode(AuthMode::ApiKey);
-                self.auth_manager.reload();
+                self.auth_manager.reload(None);
                 *self.sign_in_state.write().unwrap() = SignInState::ApiKeyConfigured;
             }
             Err(err) => {
@@ -511,7 +511,7 @@ impl AuthModeWidget {
                     match r {
                         Ok(()) => {
                             // Force the auth manager to reload the new auth information.
-                            auth_manager.reload();
+                            auth_manager.reload(None);
 
                             *sign_in_state.write().unwrap() = SignInState::ChatGptSuccessMessage;
                             request_frame.schedule_frame();

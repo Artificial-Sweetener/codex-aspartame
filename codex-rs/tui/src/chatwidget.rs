@@ -3,6 +3,7 @@ use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use chrono::Utc;
 use codex_core::config::Config;
 use codex_core::config_types::Notifications;
 use codex_core::git_info::current_branch_name;
@@ -1656,7 +1657,10 @@ impl ChatWidget {
     /// a second popup is shown to choose the reasoning effort.
     pub(crate) fn open_model_popup(&mut self) {
         let current_model = self.config.model.clone();
-        let auth_mode = self.auth_manager.auth().map(|auth| auth.mode);
+        let auth_mode = self
+            .auth_manager
+            .next_available(Utc::now())
+            .map(|selection| selection.auth.mode);
         let presets: Vec<ModelPreset> = builtin_model_presets(auth_mode);
 
         let mut grouped: Vec<(&str, Vec<ModelPreset>)> = Vec::new();
