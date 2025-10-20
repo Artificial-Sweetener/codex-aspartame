@@ -119,7 +119,7 @@ impl CodexAuth {
 
                     #[expect(clippy::unwrap_used)]
                     let mut auth_lock = self.auth_dot_json.lock().unwrap();
-                    *auth_lock = Some(updated_account.auth_dot_json.clone());
+                    *auth_lock = Some(updated_account.auth_dot_json);
                 }
 
                 Ok(tokens)
@@ -443,24 +443,13 @@ impl AccountAuth {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
+#[derive(Default)]
 pub struct TokenCounters {
     pub total_input_tokens: u64,
     pub total_output_tokens: u64,
     pub total_combined_tokens: u64,
     pub cooldown_window_input: u64,
     pub cooldown_window_output: u64,
-}
-
-impl Default for TokenCounters {
-    fn default() -> Self {
-        Self {
-            total_input_tokens: 0,
-            total_output_tokens: 0,
-            total_combined_tokens: 0,
-            cooldown_window_input: 0,
-            cooldown_window_output: 0,
-        }
-    }
 }
 
 impl TokenCounters {
@@ -665,6 +654,7 @@ impl AccountState {
     fn selection(&self) -> AccountSelection {
         AccountSelection {
             id: self.id,
+            label: self.label.clone(),
             auth: self.auth.clone(),
             cooldown_until: self.cooldown_until,
             last_refresh: self.last_refresh,
@@ -740,6 +730,7 @@ pub struct AccountSummary {
 #[derive(Clone, Debug)]
 pub struct AccountSelection {
     pub id: Uuid,
+    pub label: Option<String>,
     pub auth: CodexAuth,
     pub cooldown_until: Option<DateTime<Utc>>,
     pub last_refresh: Option<DateTime<Utc>>,
@@ -859,10 +850,8 @@ fn load_account_states(
     enable_codex_api_key_env: bool,
 ) -> std::io::Result<Vec<AccountState>> {
     let mut accounts = Vec::new();
-    if enable_codex_api_key_env {
-        if let Some(api_key) = read_codex_api_key_from_env() {
-            accounts.push(AccountState::new_from_api_key(api_key));
-        }
+    if enable_codex_api_key_env && let Some(api_key) = read_codex_api_key_from_env() {
+        accounts.push(AccountState::new_from_api_key(api_key));
     }
 
     let auth_file = get_auth_file(codex_home);
@@ -1311,9 +1300,23 @@ impl AuthManager {
             guard
                 .accounts
                 .iter()
-                .find(|account| account.cooldown_until.map_or(true, |c| c <= now))
+                .find(|account| account.cooldown_until.is_none_or(|c| c <= now))
                 .map(AccountState::selection)
         })
+    }
+
+    pub fn available_accounts(&self, now: DateTime<Utc>) -> Vec<AccountSelection> {
+        self.inner
+            .read()
+            .map(|guard| {
+                guard
+                    .accounts
+                    .iter()
+                    .filter(|account| account.cooldown_until.is_none_or(|c| c <= now))
+                    .map(AccountState::selection)
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     /// Force a reload of the auth information from auth.json. Returns
@@ -1490,10 +1493,10 @@ impl AuthManager {
             self.persist_accounts(&mut guard.accounts)?;
         } else {
             let auth_file = get_auth_file(&self.codex_home);
-            if let Err(err) = std::fs::remove_file(&auth_file) {
-                if err.kind() != std::io::ErrorKind::NotFound {
-                    return Err(err);
-                }
+            if let Err(err) = std::fs::remove_file(&auth_file)
+                && err.kind() != std::io::ErrorKind::NotFound
+            {
+                return Err(err);
             }
         }
 
@@ -1515,10 +1518,10 @@ impl AuthManager {
 
         let auth_file = get_auth_file(&self.codex_home);
         if persisted.is_empty() {
-            if let Err(err) = std::fs::remove_file(&auth_file) {
-                if err.kind() != std::io::ErrorKind::NotFound {
-                    return Err(err);
-                }
+            if let Err(err) = std::fs::remove_file(&auth_file)
+                && err.kind() != std::io::ErrorKind::NotFound
+            {
+                return Err(err);
             }
             return Ok(());
         }

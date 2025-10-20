@@ -119,14 +119,14 @@ fn write_multi_auth_json(
         id_token: codex_core::token_data::parse_id_token(&fake_jwt).unwrap(),
         access_token: access_token.to_string(),
         refresh_token: "refresh-test".to_string(),
-        account_id: account_id.map(|s| s.to_string()),
+        account_id: account_id.map(std::string::ToString::to_string),
     };
     if token_data.account_id.is_none() {
         token_data.account_id = Some("acc-123".to_string());
     }
 
     let auth = AuthDotJson {
-        openai_api_key: openai_api_key.map(|s| s.to_string()),
+        openai_api_key: openai_api_key.map(std::string::ToString::to_string),
         tokens: Some(token_data),
         last_refresh: Some(chrono::Utc::now()),
     };
@@ -179,7 +179,7 @@ fn multi_account_roundtrip_preserves_metadata() {
     account.priority = 7;
     account.cooldown_until = Some(last_refresh + chrono::Duration::minutes(5));
     account.last_error = Some("rate limited".to_string());
-    account.lifetime_usage = counters.clone();
+    account.lifetime_usage = counters;
 
     write_auth_json(&auth_path, &[account.clone()]).expect("write auth.json");
 
@@ -246,7 +246,7 @@ fn token_counters_are_serialized() {
     );
     account.lifetime_usage = counters.clone();
 
-    write_auth_json(&auth_path, &[account.clone()]).expect("write auth.json");
+    write_auth_json(&auth_path, &[account]).expect("write auth.json");
 
     let raw = std::fs::read_to_string(&auth_path).expect("read auth.json");
     let json: serde_json::Value = serde_json::from_str(&raw).expect("parse json");
