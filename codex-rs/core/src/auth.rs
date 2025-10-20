@@ -7,6 +7,9 @@ use std::cmp::Ordering;
 use std::env;
 use std::fs::File;
 use std::fs::OpenOptions;
+use std::io::BufRead;
+use std::io::BufReader;
+use std::io::Error;
 use std::io::Read;
 use std::io::Write;
 #[cfg(unix)]
@@ -638,10 +641,17 @@ impl AccountState {
     }
 
     fn summary(&self) -> AccountSummary {
+        let plan = self.auth.get_plan_type().map(|plan| match plan {
+            PlanType::Known(plan) => format!("{plan:?}"),
+            PlanType::Unknown(raw) => raw,
+        });
+
         AccountSummary {
             id: self.id,
             label: self.label.clone(),
+            plan,
             mode: self.mode,
+            priority: self.priority,
             cooldown_until: self.cooldown_until,
             last_error: self.last_error.clone(),
             last_refresh: self.last_refresh,
@@ -718,7 +728,9 @@ impl PartialEq for AccountState {
 pub struct AccountSummary {
     pub id: Uuid,
     pub label: Option<String>,
+    pub plan: Option<String>,
     pub mode: AuthMode,
+    pub priority: u32,
     pub cooldown_until: Option<DateTime<Utc>>,
     pub last_error: Option<String>,
     pub last_refresh: Option<DateTime<Utc>>,
@@ -1217,6 +1229,134 @@ mod tests {
         assert_eq!(35, account_summary.lifetime_usage.total_combined_tokens);
         assert_eq!(35, account_summary.tokens_since_last_cooldown.total_tokens);
     }
+
+    #[test]
+    fn add_account_persists_account() {
+        let dir = tempdir().unwrap();
+        let manager = AuthManager::new(dir.path().to_path_buf(), false);
+
+        let mut account = AccountAuth::new(
+            AuthMode::ApiKey,
+            AuthDotJson {
+                openai_api_key: Some("sk-test".to_string()),
+                tokens: None,
+                last_refresh: None,
+            },
+        );
+        account.label = Some("Primary".to_string());
+        account.priority = 5;
+
+        let id = manager
+            .add_account(account.clone())
+            .expect("add account to succeed");
+
+        let summaries = manager.accounts();
+        assert_eq!(summaries.len(), 1);
+        let summary = &summaries[0];
+        assert_eq!(summary.id, id);
+        assert_eq!(summary.label.as_deref(), Some("Primary"));
+        assert_eq!(summary.priority, 5);
+        assert!(summary.plan.is_none());
+
+        let persisted = load_auth_accounts(&get_auth_file(dir.path())).expect("read auth.json");
+        assert_eq!(persisted.len(), 1);
+        assert_eq!(persisted[0].id, id);
+        assert_eq!(persisted[0].label.as_deref(), Some("Primary"));
+    }
+
+    #[test]
+    fn clear_cooldown_resets_state_and_persists() {
+        let dir = tempdir().unwrap();
+        let mut account = create_test_account("primary", 0);
+        account.label = Some("Main".to_string());
+        account.cooldown_until = Some(Utc::now() + ChronoDuration::minutes(15));
+        account.last_error = Some("rate limited".to_string());
+        account.lifetime_usage.cooldown_window_input = 42;
+        account.lifetime_usage.cooldown_window_output = 24;
+
+        let manager = AuthManager::new(dir.path().to_path_buf(), false);
+        let id = manager
+            .add_account(account.clone())
+            .expect("add account with cooldown");
+
+        assert!(manager.clear_cooldown(id).expect("clear cooldown"));
+
+        let summary = manager
+            .accounts()
+            .into_iter()
+            .find(|summary| summary.id == id)
+            .expect("account summary present");
+        assert!(summary.cooldown_until.is_none());
+        assert!(summary.last_error.is_none());
+        assert_eq!(summary.lifetime_usage.cooldown_window_input, 0);
+        assert_eq!(summary.lifetime_usage.cooldown_window_output, 0);
+        assert_eq!(summary.tokens_since_last_cooldown.total_tokens, 0);
+
+        let persisted = load_auth_accounts(&get_auth_file(dir.path())).expect("read auth.json");
+        assert!(persisted[0].cooldown_until.is_none());
+        assert!(persisted[0].last_error.is_none());
+        assert_eq!(persisted[0].lifetime_usage.cooldown_window_input, 0);
+        assert_eq!(persisted[0].lifetime_usage.cooldown_window_output, 0);
+    }
+
+    #[test]
+    fn usage_history_returns_newest_first() {
+        let dir = tempdir().unwrap();
+        let manager = AuthManager::new(dir.path().to_path_buf(), false);
+        let account = create_test_account("primary", 0);
+        let account_id = manager
+            .add_account(account)
+            .expect("add account for history");
+
+        let mut counters_first = TokenCounters::default();
+        counters_first.total_combined_tokens = 10;
+        counters_first.total_input_tokens = 6;
+        counters_first.total_output_tokens = 4;
+
+        let mut counters_second = TokenCounters::default();
+        counters_second.total_combined_tokens = 20;
+        counters_second.total_input_tokens = 12;
+        counters_second.total_output_tokens = 8;
+
+        append_usage_log(
+            dir.path(),
+            &UsageLogEntry {
+                timestamp: Utc::now() - ChronoDuration::minutes(5),
+                account_id,
+                tokens_since_last_cooldown: counters_first.clone(),
+                resets_in_seconds: 120,
+                reason: Some("test".to_string()),
+                usage_snapshot: None,
+                plan_type: Some("Pro".to_string()),
+            },
+        )
+        .expect("write first log entry");
+
+        append_usage_log(
+            dir.path(),
+            &UsageLogEntry {
+                timestamp: Utc::now(),
+                account_id,
+                tokens_since_last_cooldown: counters_second.clone(),
+                resets_in_seconds: 60,
+                reason: None,
+                usage_snapshot: None,
+                plan_type: Some("Pro".to_string()),
+            },
+        )
+        .expect("write second log entry");
+
+        let history = manager
+            .usage_history(Some(1))
+            .expect("read limited usage history");
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].tokens_since_last_cooldown, counters_second);
+
+        let full_history = manager.usage_history(None).expect("read full history");
+        assert_eq!(full_history.len(), 2);
+        assert_eq!(full_history[0].tokens_since_last_cooldown, counters_second);
+        assert_eq!(full_history[1].tokens_since_last_cooldown, counters_first);
+    }
 }
 
 /// Central manager providing a single source of truth for auth.json derived
@@ -1501,6 +1641,72 @@ impl AuthManager {
         }
 
         Ok(true)
+    }
+
+    /// Add a new persisted account to the manager and save it to disk.
+    pub fn add_account(&self, account: AccountAuth) -> std::io::Result<Uuid> {
+        let mut guard = self.inner.write().map_err(|_| lock_poisoned())?;
+        if guard
+            .accounts
+            .iter()
+            .any(|existing| existing.id == account.id)
+        {
+            return Err(Error::other("account already exists"));
+        }
+
+        let state = AccountState::new(&self.codex_home, account, true)?;
+        let id = state.id;
+        guard.accounts.push(state);
+        sort_accounts(&mut guard.accounts);
+        self.persist_accounts(&mut guard.accounts)?;
+        Ok(id)
+    }
+
+    /// Clear any active cooldown on the account and reset usage counters for the window.
+    pub fn clear_cooldown(&self, id: Uuid) -> std::io::Result<bool> {
+        let mut guard = self.inner.write().map_err(|_| lock_poisoned())?;
+        let Some(account) = guard.accounts.iter_mut().find(|account| account.id == id) else {
+            return Ok(false);
+        };
+
+        account.cooldown_until = None;
+        account.last_error = None;
+        account.tokens_since_last_cooldown = TokenUsage::default();
+        account.lifetime_usage.cooldown_window_input = 0;
+        account.lifetime_usage.cooldown_window_output = 0;
+
+        self.persist_accounts(&mut guard.accounts)?;
+        Ok(true)
+    }
+
+    /// Return recent usage history entries, newest first.
+    pub fn usage_history(&self, limit: Option<usize>) -> std::io::Result<Vec<UsageLogEntry>> {
+        let log_file = get_usage_log_file(&self.codex_home);
+        let file = match File::open(&log_file) {
+            Ok(file) => file,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(err) => return Err(err),
+        };
+
+        let reader = BufReader::new(file);
+        let mut entries = Vec::new();
+        for line in reader.lines() {
+            let line = line?;
+            if line.trim().is_empty() {
+                continue;
+            }
+            let entry: UsageLogEntry = serde_json::from_str(&line).map_err(Error::other)?;
+            entries.push(entry);
+        }
+
+        entries.reverse();
+        if let Some(limit) = limit {
+            if entries.len() > limit {
+                entries.truncate(limit);
+            }
+        }
+
+        Ok(entries)
     }
 
     /// Convenience constructor returning an `Arc` wrapper.
