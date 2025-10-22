@@ -36,8 +36,6 @@ codex-rmcp-client = { workspace = true }
 codex-cloud-tasks = { path = "../cloud-tasks" }
 ctor = { workspace = true }
 owo-colors = { workspace = true }
-schemars = { workspace = true, features = ["derive"] }
-serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 supports-color = { workspace = true }
 tempfile = { workspace = true }
@@ -48,11 +46,8 @@ tokio = { workspace = true, features = [
     "rt-multi-thread",
     "signal",
 ] }
-uuid = { workspace = true }
-chrono = { workspace = true }
 
 [dev-dependencies]
-base64 = { workspace = true }
 assert_matches = { workspace = true }
 assert_cmd = { workspace = true }
 predicates = { workspace = true }
