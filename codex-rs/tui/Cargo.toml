@@ -86,6 +86,7 @@ tracing-subscriber = { workspace = true, features = ["env-filter"] }
 opentelemetry-appender-tracing = { workspace = true }
 unicode-segmentation = { workspace = true }
 unicode-width = { workspace = true }
+uuid = { workspace = true }
 url = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]

@@ -1,4 +1,8 @@
 use crate::UpdateAction;
+use crate::account_overlay;
+use crate::account_state::AccountsState;
+use crate::account_state::HISTORY_LIMIT;
+use crate::account_state::build_accounts_snapshot;
 use crate::app_backtrack::BacktrackState;
 use crate::app_event::AppEvent;
 use crate::app_event_sender::AppEventSender;
@@ -39,6 +43,7 @@ use std::thread;
 use std::time::Duration;
 use tokio::select;
 use tokio::sync::mpsc::unbounded_channel;
+use tokio::task::spawn_blocking;
 // use uuid::Uuid;
 
 #[derive(Debug, Clone)]
@@ -77,6 +82,9 @@ pub(crate) struct App {
     pub(crate) feedback: codex_feedback::CodexFeedback,
     /// Set when the user confirms an update; propagated on exit.
     pub(crate) pending_update_action: Option<UpdateAction>,
+
+    pub(crate) accounts_state: AccountsState,
+    pub(crate) accounts_overlay_open: bool,
 }
 
 impl App {
@@ -164,7 +172,11 @@ impl App {
             backtrack: BacktrackState::default(),
             feedback: feedback.clone(),
             pending_update_action: None,
+            accounts_state: AccountsState::default(),
+            accounts_overlay_open: false,
         };
+
+        app.refresh_accounts_state().await;
 
         let tui_events = tui.event_stream();
         tokio::pin!(tui_events);
@@ -185,6 +197,57 @@ impl App {
             conversation_id: app.chat_widget.conversation_id(),
             update_action: app.pending_update_action,
         })
+    }
+
+    async fn refresh_accounts_state(&mut self) {
+        let auth_manager = Arc::clone(&self.auth_manager);
+        let result = spawn_blocking(move || -> Result<_, std::io::Error> {
+            let accounts = auth_manager.accounts();
+            let history = auth_manager.usage_history(Some(HISTORY_LIMIT))?;
+            Ok(build_accounts_snapshot(accounts, history))
+        })
+        .await;
+
+        match result {
+            Ok(Ok(snapshot)) => {
+                self.accounts_state.apply_snapshot(snapshot);
+                self.accounts_state.clear_error();
+            }
+            Ok(Err(err)) => {
+                tracing::error!(error = %err, "failed to refresh account state");
+                self.accounts_state
+                    .set_error(format!("Failed to load account data: {err}"));
+            }
+            Err(err) => {
+                tracing::error!(error = %err, "failed to join account state task");
+                self.accounts_state
+                    .set_error("Failed to load account data".to_string());
+            }
+        }
+    }
+
+    fn rebuild_accounts_overlay(&mut self, tui: &mut tui::Tui) {
+        if !self.accounts_overlay_open {
+            return;
+        }
+        let renderables = account_overlay::build_overlay(&self.accounts_state);
+        self.overlay = Some(Overlay::new_static_with_renderables(
+            renderables,
+            "A C C O U N T S".to_string(),
+        ));
+        tui.frame_requester().schedule_frame();
+    }
+
+    async fn open_accounts_overlay(&mut self, tui: &mut tui::Tui) {
+        self.refresh_accounts_state().await;
+        let renderables = account_overlay::build_overlay(&self.accounts_state);
+        let _ = tui.enter_alt_screen();
+        self.overlay = Some(Overlay::new_static_with_renderables(
+            renderables,
+            "A C C O U N T S".to_string(),
+        ));
+        self.accounts_overlay_open = true;
+        tui.frame_requester().schedule_frame();
     }
 
     pub(crate) async fn handle_tui_event(
@@ -245,6 +308,7 @@ impl App {
                 };
                 self.chat_widget = ChatWidget::new(init, self.server.clone());
                 tui.frame_requester().schedule_frame();
+                self.refresh_accounts_state().await;
             }
             AppEvent::InsertHistoryCell(cell) => {
                 let cell: Arc<dyn HistoryCell> = cell.into();
@@ -297,6 +361,13 @@ impl App {
             AppEvent::CodexEvent(event) => {
                 self.chat_widget.handle_codex_event(event);
             }
+            AppEvent::AccountEvent(event) => {
+                self.accounts_state.record_event(&event);
+                self.refresh_accounts_state().await;
+                if self.accounts_overlay_open {
+                    self.rebuild_accounts_overlay(tui);
+                }
+            }
             AppEvent::ConversationHistory(ev) => {
                 self.on_conversation_history_for_backtrack(tui, ev).await?;
             }
@@ -318,6 +389,7 @@ impl App {
                     pager_lines,
                     "D I F F".to_string(),
                 ));
+                self.accounts_overlay_open = false;
                 tui.frame_requester().schedule_frame();
             }
             AppEvent::StartFileSearch(query) => {
@@ -423,6 +495,7 @@ impl App {
                         vec![diff_summary.into()],
                         "P A T C H".to_string(),
                     ));
+                    self.accounts_overlay_open = false;
                 }
                 ApprovalRequest::Exec { command, .. } => {
                     let _ = tui.enter_alt_screen();
@@ -432,6 +505,7 @@ impl App {
                         full_cmd_lines,
                         "E X E C".to_string(),
                     ));
+                    self.accounts_overlay_open = false;
                 }
             },
         }
@@ -450,6 +524,19 @@ impl App {
     async fn handle_key_event(&mut self, tui: &mut tui::Tui, key_event: KeyEvent) {
         match key_event {
             KeyEvent {
+                code: KeyCode::Char('a'),
+                modifiers: crossterm::event::KeyModifiers::CONTROL,
+                kind: KeyEventKind::Press,
+                ..
+            } => {
+                if self.accounts_overlay_open {
+                    self.close_transcript_overlay(tui);
+                    self.accounts_overlay_open = false;
+                } else {
+                    self.open_accounts_overlay(tui).await;
+                }
+            }
+            KeyEvent {
                 code: KeyCode::Char('t'),
                 modifiers: crossterm::event::KeyModifiers::CONTROL,
                 kind: KeyEventKind::Press,
@@ -458,6 +545,7 @@ impl App {
                 // Enter alternate screen and set viewport to full size.
                 let _ = tui.enter_alt_screen();
                 self.overlay = Some(Overlay::new_transcript(self.transcript_cells.clone()));
+                self.accounts_overlay_open = false;
                 tui.frame_requester().schedule_frame();
             }
             // Esc primes/advances backtracking only in normal (not working) mode
@@ -557,6 +645,8 @@ mod tests {
             backtrack: BacktrackState::default(),
             feedback: codex_feedback::CodexFeedback::new(),
             pending_update_action: None,
+            accounts_state: AccountsState::default(),
+            accounts_overlay_open: false,
         }
     }
 

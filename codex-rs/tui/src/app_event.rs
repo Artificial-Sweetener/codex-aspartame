@@ -2,6 +2,7 @@ use std::path::PathBuf;
 
 use codex_common::approval_presets::ApprovalPreset;
 use codex_common::model_presets::ModelPreset;
+use codex_core::protocol::AccountEvent;
 use codex_core::protocol::ConversationPathResponseEvent;
 use codex_core::protocol::Event;
 use codex_file_search::FileMatch;
@@ -90,6 +91,9 @@ pub(crate) enum AppEvent {
 
     /// Forwarded conversation history snapshot from the current conversation.
     ConversationHistory(ConversationPathResponseEvent),
+
+    /// Forwarded account activity event from Codex.
+    AccountEvent(AccountEvent),
 
     /// Open the branch picker option from the review popup.
     OpenReviewBranchPicker(PathBuf),

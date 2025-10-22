@@ -1496,6 +1496,9 @@ impl ChatWidget {
                 self.on_background_event(message)
             }
             EventMsg::StreamError(StreamErrorEvent { message }) => self.on_stream_error(message),
+            EventMsg::AccountEvent(event) => {
+                self.app_event_tx.send(AppEvent::AccountEvent(event));
+            }
             EventMsg::UserMessage(ev) => {
                 if from_replay {
                     self.on_user_message_event(ev);

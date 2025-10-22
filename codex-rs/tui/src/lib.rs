@@ -26,6 +26,8 @@ use tracing_subscriber::EnvFilter;
 use tracing_subscriber::filter::Targets;
 use tracing_subscriber::prelude::*;
 
+mod account_overlay;
+mod account_state;
 mod app;
 mod app_backtrack;
 mod app_event;

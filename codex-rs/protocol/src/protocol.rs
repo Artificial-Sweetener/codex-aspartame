@@ -437,6 +437,9 @@ pub enum EventMsg {
     /// Optional means unknown — UIs should not display when `None`.
     TokenCount(TokenCountEvent),
 
+    /// Notification describing account selection, usage, and cooldown events.
+    AccountEvent(AccountEvent),
+
     /// Agent text output message
     AgentMessage(AgentMessageEvent),
 
@@ -568,6 +571,37 @@ pub struct TokenUsageInfo {
     pub last_token_usage: TokenUsage,
     #[ts(type = "number | null")]
     pub model_context_window: Option<u64>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, TS)]
+pub struct AccountEvent {
+    pub account_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub plan_type: Option<String>,
+    pub timestamp: String,
+    pub kind: AccountEventKind,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, TS)]
+#[serde(tag = "event", rename_all = "snake_case")]
+pub enum AccountEventKind {
+    Selected,
+    UsageRecorded {
+        usage: TokenUsage,
+    },
+    CooldownStarted {
+        #[ts(type = "string | null")]
+        cooldown_until: Option<String>,
+        tokens_since_last: TokenUsage,
+        #[ts(type = "number")]
+        resets_in_seconds: u64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        rate_limits: Option<RateLimitSnapshot>,
+    },
 }
 
 impl TokenUsageInfo {

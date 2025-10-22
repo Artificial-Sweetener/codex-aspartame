@@ -284,7 +284,6 @@ impl std::fmt::Display for UsageLimitReachedError {
 
 #[derive(Debug, Clone)]
 pub struct UsageNotIncludedError {
-    pub(crate) plan_type: Option<PlanType>,
     pub(crate) resets_in_seconds: Option<u64>,
     pub(crate) request_id: Option<String>,
     pub(crate) tokens_consumed: Option<u64>,
@@ -694,7 +693,6 @@ mod tests {
     #[test]
     fn usage_not_included_error_defaults_to_upgrade_message() {
         let err = UsageNotIncludedError {
-            plan_type: None,
             resets_in_seconds: None,
             request_id: None,
             tokens_consumed: None,
@@ -709,7 +707,6 @@ mod tests {
     #[test]
     fn usage_not_included_error_uses_server_message_when_available() {
         let err = UsageNotIncludedError {
-            plan_type: Some(PlanType::Known(KnownPlan::Plus)),
             resets_in_seconds: Some(120),
             request_id: Some("req_123".to_string()),
             tokens_consumed: Some(42),
