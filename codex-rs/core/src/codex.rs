@@ -2,7 +2,6 @@ use std::borrow::Cow;
 use std::fmt::Debug;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::Mutex as StdMutex;
 use std::sync::atomic::AtomicU64;
 
 use crate::AuthManager;
@@ -76,6 +75,8 @@ use crate::openai_tools::ToolsConfig;
 use crate::openai_tools::ToolsConfigParams;
 use crate::parse_command::parse_command;
 use crate::project_doc::get_user_instructions;
+use crate::protocol::AccountEvent;
+use crate::protocol::AccountEventKind;
 use crate::protocol::AgentMessageDeltaEvent;
 use crate::protocol::AgentReasoningDeltaEvent;
 use crate::protocol::AgentReasoningRawContentDeltaEvent;
@@ -138,7 +139,6 @@ use codex_protocol::models::FunctionCallOutputPayload;
 use codex_protocol::models::ResponseInputItem;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::InitialHistory;
-use uuid::Uuid;
 
 pub mod compact;
 use self::compact::build_compacted_history;
@@ -280,7 +280,6 @@ pub(crate) struct TurnContext {
     pub(crate) tools_config: ToolsConfig,
     pub(crate) is_review_mode: bool,
     pub(crate) final_output_json_schema: Option<Value>,
-    pub(crate) account_snapshot: StdMutex<Option<TurnAccountSnapshot>>,
 }
 
 impl TurnContext {
@@ -289,36 +288,26 @@ impl TurnContext {
             .map(PathBuf::from)
             .map_or_else(|| self.cwd.clone(), |p| self.cwd.join(p))
     }
+}
 
-    pub(crate) fn set_account_snapshot(&self, snapshot: Option<TurnAccountSnapshot>) {
-        if let Ok(mut guard) = self.account_snapshot.lock() {
-            *guard = snapshot;
-        }
-    }
-
-    pub(crate) fn account_snapshot(&self) -> Option<TurnAccountSnapshot> {
-        self.account_snapshot
-            .lock()
-            .ok()
-            .and_then(|guard| guard.clone())
+fn format_plan_type(plan_type: PlanType) -> String {
+    match plan_type {
+        PlanType::Known(kind) => format!("{kind:?}"),
+        PlanType::Unknown(value) => value,
     }
 }
 
-#[derive(Clone, Debug)]
-pub(crate) struct TurnAccountSnapshot {
-    pub id: Uuid,
-    pub label: Option<String>,
-    pub plan_type: Option<PlanType>,
-}
-
-impl TurnAccountSnapshot {
-    fn from_selection(selection: &AccountSelection) -> Self {
-        let plan_type = selection.auth.get_plan_type();
-        Self {
-            id: selection.id,
-            label: selection.label.clone(),
-            plan_type,
-        }
+fn account_event_for(
+    selection: &AccountSelection,
+    timestamp: DateTime<Utc>,
+    kind: AccountEventKind,
+) -> AccountEvent {
+    AccountEvent {
+        account_id: selection.id.to_string(),
+        label: selection.label.clone(),
+        plan_type: selection.auth.get_plan_type().map(format_plan_type),
+        timestamp: timestamp.to_rfc3339_opts(SecondsFormat::Secs, true),
+        kind,
     }
 }
 
@@ -444,7 +433,6 @@ impl Session {
             tools_config,
             is_review_mode: false,
             final_output_json_schema: None,
-            account_snapshot: StdMutex::new(None),
         }
     }
 
@@ -1686,7 +1674,6 @@ async fn spawn_review_thread(
         cwd: parent_turn_context.cwd.clone(),
         is_review_mode: true,
         final_output_json_schema: None,
-        account_snapshot: StdMutex::new(None),
     };
 
     // Seed the child task with the review prompt as the initial user message.
@@ -2051,7 +2038,6 @@ async fn run_turn(
 ) -> CodexResult<TurnRunResult> {
     let Some(auth_manager) = turn_context.client.get_auth_manager() else {
         turn_context.client.set_account_selection(None);
-        turn_context.set_account_snapshot(None);
         return run_turn_once(
             sess,
             turn_context,
@@ -2089,7 +2075,17 @@ async fn run_turn(
         turn_context
             .client
             .set_account_selection(Some(selection.clone()));
-        turn_context.set_account_snapshot(Some(TurnAccountSnapshot::from_selection(&selection)));
+
+        let timestamp = Utc::now();
+        let event = Event {
+            id: sub_id.clone(),
+            msg: EventMsg::AccountEvent(account_event_for(
+                &selection,
+                timestamp,
+                AccountEventKind::Selected,
+            )),
+        };
+        sess.send_event(event).await;
 
         match run_turn_once(
             Arc::clone(&sess),
@@ -2103,10 +2099,19 @@ async fn run_turn(
         .await
         {
             Ok(result) => {
-                if let Some(usage) = result.total_token_usage.clone()
-                    && let Err(err) = auth_manager.register_usage(selection.id, usage)
-                {
-                    debug!("failed to record usage: {err:#}");
+                if let Some(usage) = result.total_token_usage.clone() {
+                    if let Err(err) = auth_manager.register_usage(selection.id, usage.clone()) {
+                        debug!("failed to record usage: {err:#}");
+                    }
+                    let usage_event = Event {
+                        id: sub_id.clone(),
+                        msg: EventMsg::AccountEvent(account_event_for(
+                            &selection,
+                            Utc::now(),
+                            AccountEventKind::UsageRecorded { usage },
+                        )),
+                    };
+                    sess.send_event(usage_event).await;
                 }
                 return Ok(result);
             }
@@ -2127,6 +2132,7 @@ async fn run_turn(
                     &selection,
                     cooldown_until,
                     &tokens_since_last,
+                    err.resets_in_seconds,
                     reason.clone(),
                     err.request_id.clone(),
                     err.rate_limits.clone(),
@@ -2153,6 +2159,7 @@ async fn run_turn(
                     &selection,
                     cooldown_until,
                     &tokens_since_last,
+                    err.resets_in_seconds,
                     reason.clone(),
                     err.request_id.clone(),
                     None,
@@ -2561,10 +2568,12 @@ async fn log_account_cooldown(
     selection: &AccountSelection,
     cooldown_until: DateTime<Utc>,
     tokens_since_last: &TokenUsage,
+    resets_in_seconds: Option<u64>,
     reason: Option<String>,
     request_id: Option<String>,
     snapshot: Option<RateLimitSnapshot>,
 ) {
+    let snapshot_for_event = snapshot.clone();
     if let Err(err) = auth_manager.mark_cooldown(
         selection.id,
         cooldown_until,
@@ -2575,13 +2584,14 @@ async fn log_account_cooldown(
         debug!("failed to record cooldown: {err:#}");
     }
 
+    let now = Utc::now();
     let label = selection
         .label
         .clone()
         .unwrap_or_else(|| selection.id.to_string());
     let total_tokens = tokens_since_last.total_tokens;
     let remaining_secs = cooldown_until
-        .signed_duration_since(Utc::now())
+        .signed_duration_since(now)
         .num_seconds()
         .max(0) as u64;
     let duration_text = format_duration_short(remaining_secs);
@@ -2594,6 +2604,21 @@ async fn log_account_cooldown(
         request_id = request_id.as_deref().unwrap_or(""),
         "account entered cooldown"
     );
+    let cooldown_event = Event {
+        id: sub_id.to_string(),
+        msg: EventMsg::AccountEvent(account_event_for(
+            selection,
+            now,
+            AccountEventKind::CooldownStarted {
+                cooldown_until: Some(cooldown_until.to_rfc3339_opts(SecondsFormat::Secs, true)),
+                tokens_since_last: tokens_since_last.clone(),
+                resets_in_seconds: resets_in_seconds.unwrap_or(remaining_secs),
+                reason: reason.clone(),
+                rate_limits: snapshot_for_event,
+            },
+        )),
+    };
+    sess.send_event(cooldown_event).await;
     let message =
         format!("Account {label} cooling down for {duration_text} after {total_tokens} tokens");
     sess.notify_stream_error(sub_id, message).await;

@@ -512,7 +512,8 @@ impl StaticOverlay {
         let line1 = Rect::new(area.x, area.y, area.width, 1);
         let line2 = Rect::new(area.x, area.y.saturating_add(1), area.width, 1);
         render_key_hints(line1, buf, PAGER_KEY_HINTS);
-        let pairs: Vec<(&[KeyBinding], &str)> = vec![(&[KEY_Q], "to quit")];
+        let pairs: Vec<(&[KeyBinding], &str)> =
+            vec![(&[KEY_Q, KEY_ESC], "to close"), (&[KEY_CTRL_C], "to abort")];
         render_key_hints(line2, buf, &pairs);
     }
 
@@ -529,7 +530,7 @@ impl StaticOverlay {
     pub(crate) fn handle_event(&mut self, tui: &mut tui::Tui, event: TuiEvent) -> Result<()> {
         match event {
             TuiEvent::Key(key_event) => match key_event {
-                e if KEY_Q.is_press(e) || KEY_CTRL_C.is_press(e) => {
+                e if KEY_Q.is_press(e) || KEY_ESC.is_press(e) || KEY_CTRL_C.is_press(e) => {
                     self.is_done = true;
                     Ok(())
                 }

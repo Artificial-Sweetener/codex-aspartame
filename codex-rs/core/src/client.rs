@@ -23,7 +23,6 @@ use serde::Deserialize;
 use serde::Serialize;
 use serde_json::Value;
 use tokio::sync::mpsc;
-use tokio::sync::oneshot;
 use tokio::time::timeout;
 use tokio_util::io::ReaderStream;
 use tracing::debug;
@@ -195,10 +194,7 @@ impl ModelClient {
                     }
                 });
 
-                Ok(ResponseStream {
-                    rx_event: rx,
-                    final_usage: None,
-                })
+                Ok(ResponseStream { rx_event: rx })
             }
         }
     }
@@ -393,8 +389,6 @@ impl ModelClient {
         match res {
             Ok(resp) if resp.status().is_success() => {
                 let (tx_event, rx_event) = mpsc::channel::<Result<ResponseEvent>>(1600);
-                let (usage_tx, usage_rx) = oneshot::channel();
-
                 if let Some(snapshot) = parse_rate_limit_snapshot(resp.headers())
                     && tx_event
                         .send(Ok(ResponseEvent::RateLimits(snapshot)))
@@ -411,19 +405,14 @@ impl ModelClient {
                         request_id: request_id.clone(),
                     })
                 });
-                let usage_sender = Some(usage_tx);
                 tokio::spawn(process_sse(
                     stream,
                     tx_event,
                     self.provider.stream_idle_timeout(),
                     self.otel_event_manager.clone(),
-                    usage_sender,
                 ));
 
-                Ok(ResponseStream {
-                    rx_event,
-                    final_usage: Some(usage_rx),
-                })
+                Ok(ResponseStream { rx_event })
             }
             Ok(res) => {
                 let status = res.status();
@@ -496,7 +485,6 @@ impl ModelClient {
                         }
                         if error.r#type.as_deref() == Some("usage_not_included") {
                             let codex_err = CodexErr::UsageNotIncluded(UsageNotIncludedError {
-                                plan_type,
                                 resets_in_seconds,
                                 request_id: request_id.clone(),
                                 tokens_consumed: error.tokens_consumed,
@@ -755,7 +743,6 @@ async fn process_sse<S>(
     tx_event: mpsc::Sender<Result<ResponseEvent>>,
     idle_timeout: Duration,
     otel_event_manager: OtelEventManager,
-    mut usage_tx: Option<oneshot::Sender<Option<TokenUsage>>>,
 ) where
     S: Stream<Item = Result<Bytes>> + Unpin,
 {
@@ -778,9 +765,6 @@ async fn process_sse<S>(
                 debug!("SSE Error: {e:#}");
                 let event = CodexErr::Stream(e.to_string(), None);
                 let _ = tx_event.send(Err(event)).await;
-                if let Some(tx) = usage_tx.take() {
-                    let _ = tx.send(None);
-                }
                 return;
             }
             Ok(None) => {
@@ -805,9 +789,6 @@ async fn process_sse<S>(
                             );
                         }
                         let converted_usage: Option<TokenUsage> = usage.clone().map(Into::into);
-                        if let Some(tx) = usage_tx.take() {
-                            let _ = tx.send(converted_usage.clone());
-                        }
                         let event = ResponseEvent::Completed {
                             response_id,
                             token_usage: converted_usage,
@@ -822,9 +803,6 @@ async fn process_sse<S>(
                         otel_event_manager.see_event_completed_failed(&error);
 
                         let _ = tx_event.send(Err(error)).await;
-                        if let Some(tx) = usage_tx.take() {
-                            let _ = tx.send(None);
-                        }
                     }
                 }
                 return;
@@ -836,9 +814,6 @@ async fn process_sse<S>(
                         None,
                     )))
                     .await;
-                if let Some(tx) = usage_tx.take() {
-                    let _ = tx.send(None);
-                }
                 return;
             }
         };
@@ -1015,18 +990,13 @@ async fn stream_from_fixture(
 
     let rdr = std::io::Cursor::new(content);
     let stream = ReaderStream::new(rdr).map_err(CodexErr::Io);
-    let (usage_tx, usage_rx) = oneshot::channel();
     tokio::spawn(process_sse(
         stream,
         tx_event,
         provider.stream_idle_timeout(),
         otel_event_manager,
-        Some(usage_tx),
     ));
-    Ok(ResponseStream {
-        rx_event,
-        final_usage: Some(usage_rx),
-    })
+    Ok(ResponseStream { rx_event })
 }
 
 fn rate_limit_regex() -> &'static Regex {
