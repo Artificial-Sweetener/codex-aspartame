@@ -84,6 +84,9 @@ fn account_header_line(account: &AccountDisplay, is_active: bool) -> Line<'stati
     });
 
     let mut meta_parts: Vec<String> = Vec::new();
+    if account.email != account.label {
+        meta_parts.push(account.email.clone());
+    }
     if let Some(plan) = &account.plan {
         meta_parts.push(plan.clone());
     }

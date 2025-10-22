@@ -13,7 +13,9 @@ pub enum SlashCommand {
     // DO NOT ALPHA-SORT! Enum order is presentation order in the popup, so
     // more frequently used commands should be listed first.
     Model,
+    Auth,
     Approvals,
+    AuthInfo,
     Review,
     New,
     Init,
@@ -45,7 +47,9 @@ impl SlashCommand {
             SlashCommand::Mention => "mention a file",
             SlashCommand::Status => "show current session configuration and token usage",
             SlashCommand::Model => "choose what model and reasoning effort to use",
+            SlashCommand::Auth => "quickly switch between authenticated accounts",
             SlashCommand::Approvals => "choose what Codex can do without approval",
+            SlashCommand::AuthInfo => "show detailed account usage and cooldown history",
             SlashCommand::Mcp => "list configured MCP tools",
             SlashCommand::Logout => "log out of Codex",
             #[cfg(debug_assertions)]
@@ -67,7 +71,9 @@ impl SlashCommand {
             | SlashCommand::Compact
             | SlashCommand::Undo
             | SlashCommand::Model
+            | SlashCommand::Auth
             | SlashCommand::Approvals
+            | SlashCommand::AuthInfo
             | SlashCommand::Review
             | SlashCommand::Logout => false,
             SlashCommand::Diff

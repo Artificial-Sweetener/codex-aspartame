@@ -65,6 +65,10 @@ use ratatui::widgets::Wrap;
 use tokio::sync::mpsc::UnboundedSender;
 use tracing::debug;
 
+use crate::account_state::AccountDisplay;
+use crate::account_state::AccountStatus;
+use crate::account_state::AccountsState;
+use crate::account_state::format_duration_short;
 use crate::app_event::AppEvent;
 use crate::app_event_sender::AppEventSender;
 use crate::bottom_pane::ApprovalRequest;
@@ -235,6 +239,7 @@ pub(crate) struct ChatWidget {
     active_cell: Option<Box<dyn HistoryCell>>,
     config: Config,
     auth_manager: Arc<AuthManager>,
+    accounts_state: AccountsState,
     session_header: SessionHeader,
     initial_user_message: Option<UserMessage>,
     token_info: Option<TokenUsageInfo>,
@@ -942,6 +947,7 @@ impl ChatWidget {
             active_cell: None,
             config: config.clone(),
             auth_manager,
+            accounts_state: AccountsState::default(),
             session_header: SessionHeader::new(config.model),
             initial_user_message: create_initial_user_message(
                 initial_prompt.unwrap_or_default(),
@@ -1009,6 +1015,7 @@ impl ChatWidget {
             active_cell: None,
             config: config.clone(),
             auth_manager,
+            accounts_state: AccountsState::default(),
             session_header: SessionHeader::new(config.model),
             initial_user_message: create_initial_user_message(
                 initial_prompt.unwrap_or_default(),
@@ -1183,8 +1190,14 @@ impl ChatWidget {
             SlashCommand::Model => {
                 self.open_model_popup();
             }
+            SlashCommand::Auth => {
+                self.app_event_tx.send(AppEvent::OpenAuthSwitcher);
+            }
             SlashCommand::Approvals => {
                 self.open_approvals_popup();
+            }
+            SlashCommand::AuthInfo => {
+                self.app_event_tx.send(AppEvent::OpenAuthInfo);
             }
             SlashCommand::Quit => {
                 self.app_event_tx.send(AppEvent::ExitRequest);
@@ -1654,6 +1667,88 @@ impl ChatWidget {
             &self.conversation_id,
             self.rate_limit_snapshot.as_ref(),
         ));
+    }
+
+    pub(crate) fn update_accounts_state(&mut self, state: &AccountsState) {
+        self.accounts_state = state.clone();
+    }
+
+    pub(crate) fn open_auth_switcher_popup(&mut self, state: &AccountsState) {
+        if state.accounts.is_empty() {
+            self.add_info_message("No authenticated accounts configured.".to_string(), None);
+            return;
+        }
+        self.accounts_state = state.clone();
+
+        let mut items: Vec<SelectionItem> = state
+            .accounts
+            .iter()
+            .map(|account| self.build_account_selection_item(account, state))
+            .collect();
+
+        items.push(SelectionItem {
+            name: "Link new ChatGPT+ account".to_string(),
+            description: Some("Launch the ChatGPT linking flow".to_string()),
+            actions: vec![Box::new(|tx| tx.send(AppEvent::LinkChatgptAccount))],
+            dismiss_on_select: true,
+            ..Default::default()
+        });
+
+        self.bottom_pane.show_selection_view(SelectionViewParams {
+            title: Some("Switch Authenticated Account".to_string()),
+            subtitle: Some("Promote an account for future turns".to_string()),
+            footer_hint: Some(standard_popup_hint_line()),
+            items,
+            ..Default::default()
+        });
+    }
+
+    fn build_account_selection_item(
+        &self,
+        account: &AccountDisplay,
+        state: &AccountsState,
+    ) -> SelectionItem {
+        let status_description = match &account.status {
+            AccountStatus::Ready => "Ready".to_string(),
+            AccountStatus::CoolingDown { cooldown_until } => {
+                let remaining_secs = cooldown_until
+                    .with_timezone(&Local)
+                    .signed_duration_since(Local::now())
+                    .num_seconds()
+                    .max(0) as u64;
+                if remaining_secs == 0 {
+                    "Cooling down".to_string()
+                } else {
+                    format!("Cooling down ({})", format_duration_short(remaining_secs))
+                }
+            }
+            AccountStatus::Error(message) => format!("Error: {message}"),
+        };
+        let plan_description = account.plan.as_ref().map(|plan| format!("Plan: {plan}"));
+        let mut description_parts: Vec<String> = Vec::new();
+        description_parts.push(status_description);
+        if let Some(plan) = plan_description {
+            description_parts.push(plan);
+        }
+        description_parts.push(format!("Mode: {}", account.mode_label));
+
+        let account_id = account.id;
+        let mut search_value = vec![account.label.clone(), account.email.clone()];
+        if let Some(plan) = &account.plan {
+            search_value.push(plan.clone());
+        }
+
+        SelectionItem {
+            name: account.email.clone(),
+            description: Some(description_parts.join(" • ")),
+            is_current: state.active_account_id == Some(account.id),
+            actions: vec![Box::new(move |tx| {
+                tx.send(AppEvent::SwitchToAccount(account_id))
+            })],
+            dismiss_on_select: true,
+            search_value: Some(search_value.join(" ")),
+            ..Default::default()
+        }
     }
 
     /// Open a popup to choose the model (stage 1). After selecting a model,

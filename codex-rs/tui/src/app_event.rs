@@ -6,6 +6,7 @@ use codex_core::protocol::AccountEvent;
 use codex_core::protocol::ConversationPathResponseEvent;
 use codex_core::protocol::Event;
 use codex_file_search::FileMatch;
+use uuid::Uuid;
 
 use crate::bottom_pane::ApprovalRequest;
 use crate::history_cell::HistoryCell;
@@ -94,6 +95,21 @@ pub(crate) enum AppEvent {
 
     /// Forwarded account activity event from Codex.
     AccountEvent(AccountEvent),
+
+    /// Open the auth account switcher popup.
+    OpenAuthSwitcher,
+    /// Open the auth detail overlay.
+    OpenAuthInfo,
+    /// Trigger linking a new ChatGPT account.
+    LinkChatgptAccount,
+    /// Promote the selected account to preferred.
+    SwitchToAccount(Uuid),
+    /// Request loading history for an account in the overlay.
+    #[allow(dead_code)]
+    ShowAccountHistory(Uuid),
+    /// Refresh auth state after external changes.
+    #[allow(dead_code)]
+    RefreshAuthState,
 
     /// Open the branch picker option from the review popup.
     OpenReviewBranchPicker(PathBuf),

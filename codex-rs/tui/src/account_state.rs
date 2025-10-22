@@ -23,6 +23,12 @@ pub(crate) struct AccountsState {
     pub active_account_id: Option<Uuid>,
     pub accounts: Vec<AccountDisplay>,
     pub history: Vec<CooldownHistoryEntry>,
+    #[allow(dead_code)]
+    pub history_by_account: HashMap<Uuid, Vec<CooldownHistoryEntry>>,
+    #[allow(dead_code)]
+    pub selected_history_account: Option<Uuid>,
+    #[allow(dead_code)]
+    pub loading_history_for: Option<Uuid>,
     pub last_event: Option<AccountEventSummary>,
     pub error_message: Option<String>,
 }
@@ -31,6 +37,7 @@ pub(crate) struct AccountsState {
 pub(crate) struct AccountDisplay {
     pub id: Uuid,
     pub label: String,
+    pub email: String,
     pub plan: Option<String>,
     pub mode_label: String,
     pub status: AccountStatus,
@@ -119,6 +126,28 @@ impl AccountsState {
     pub(crate) fn clear_error(&mut self) {
         self.error_message = None;
     }
+
+    #[allow(dead_code)]
+    pub(crate) fn set_history_loading(&mut self, account: Option<Uuid>) {
+        self.loading_history_for = account;
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn set_history_for_account(
+        &mut self,
+        account: Uuid,
+        history: Vec<CooldownHistoryEntry>,
+    ) {
+        self.history_by_account.insert(account, history);
+        self.loading_history_for = self
+            .loading_history_for
+            .filter(|loading| *loading != account);
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn select_history_account(&mut self, account: Option<Uuid>) {
+        self.selected_history_account = account;
+    }
 }
 
 impl AccountEventSummary {
@@ -193,7 +222,13 @@ impl AccountEventSummary {
 }
 
 fn map_account_summary(summary: AccountSummary, now: DateTime<Utc>) -> AccountDisplay {
-    let label = summary.label.unwrap_or_else(|| summary.id.to_string());
+    let email = summary.email.clone().unwrap_or_else(|| {
+        summary
+            .label
+            .clone()
+            .unwrap_or_else(|| summary.id.to_string())
+    });
+    let label = summary.label.unwrap_or_else(|| email.clone());
     let plan = summary
         .plan
         .filter(|s| !s.is_empty())
@@ -212,6 +247,7 @@ fn map_account_summary(summary: AccountSummary, now: DateTime<Utc>) -> AccountDi
     AccountDisplay {
         id: summary.id,
         label,
+        email,
         plan,
         mode_label,
         status,
