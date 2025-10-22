@@ -649,6 +649,7 @@ impl AccountState {
         AccountSummary {
             id: self.id,
             label: self.label.clone(),
+            email: self.auth.get_account_email(),
             plan,
             mode: self.mode,
             priority: self.priority,
@@ -728,6 +729,7 @@ impl PartialEq for AccountState {
 pub struct AccountSummary {
     pub id: Uuid,
     pub label: Option<String>,
+    pub email: Option<String>,
     pub plan: Option<String>,
     pub mode: AuthMode,
     pub priority: u32,
@@ -1357,6 +1359,89 @@ mod tests {
         assert_eq!(full_history[0].tokens_since_last_cooldown, counters_second);
         assert_eq!(full_history[1].tokens_since_last_cooldown, counters_first);
     }
+
+    #[test]
+    fn set_preferred_account_promotes_selected_priority() {
+        let accounts = vec![
+            create_test_account("first", 2),
+            create_test_account("second", 0),
+            create_test_account("third", 1),
+        ];
+        let (dir, manager, ids) = create_manager_with_accounts(accounts);
+        let preferred_id = ids[0];
+
+        manager
+            .set_preferred_account(preferred_id)
+            .expect("set preferred account");
+
+        let summaries = manager.accounts();
+        let ordered_ids: Vec<Uuid> = summaries.iter().map(|summary| summary.id).collect();
+        assert_eq!(ordered_ids, vec![preferred_id, ids[1], ids[2]]);
+        assert_eq!(summaries[0].priority, 0);
+        assert_eq!(summaries[1].priority, 1);
+        assert_eq!(summaries[2].priority, 2);
+        assert_eq!(summaries[0].email.as_deref(), Some("user@example.com"));
+
+        let persisted =
+            load_auth_accounts(&get_auth_file(dir.path())).expect("reload persisted accounts");
+        let mut persisted_priorities: Vec<(Uuid, u32)> = persisted
+            .into_iter()
+            .map(|account| (account.id, account.priority))
+            .collect();
+        persisted_priorities.sort_by_key(|(_, priority)| *priority);
+        assert_eq!(persisted_priorities[0], (preferred_id, 0));
+    }
+
+    #[test]
+    fn usage_history_for_filters_by_account_and_limit() {
+        let dir = tempdir().unwrap();
+        let manager = AuthManager::new(dir.path().to_path_buf(), false);
+        let first_id = manager
+            .add_account(create_test_account("first", 0))
+            .expect("add first account");
+        let second_id = manager
+            .add_account(create_test_account("second", 1))
+            .expect("add second account");
+
+        let entry = |account_id: Uuid, offset: i64, total: u64| UsageLogEntry {
+            timestamp: Utc::now() + ChronoDuration::seconds(offset),
+            account_id,
+            tokens_since_last_cooldown: TokenCounters {
+                total_combined_tokens: total,
+                total_input_tokens: total / 2,
+                total_output_tokens: total / 2,
+                cooldown_window_input: 0,
+                cooldown_window_output: 0,
+            },
+            resets_in_seconds: 60,
+            reason: None,
+            usage_snapshot: None,
+            plan_type: Some("Pro".to_string()),
+        };
+
+        append_usage_log(dir.path(), &entry(first_id, -60, 10)).expect("write first account entry");
+        append_usage_log(dir.path(), &entry(second_id, -30, 20))
+            .expect("write second account entry");
+        append_usage_log(dir.path(), &entry(first_id, 0, 30)).expect("write newest entry");
+
+        let limited = manager
+            .usage_history_for(first_id, Some(1))
+            .expect("limited filtered history");
+        assert_eq!(limited.len(), 1);
+        assert_eq!(limited[0].account_id, first_id);
+        assert_eq!(
+            limited[0].tokens_since_last_cooldown.total_combined_tokens,
+            30
+        );
+
+        let full = manager
+            .usage_history_for(first_id, None)
+            .expect("full filtered history");
+        assert_eq!(full.len(), 2);
+        assert!(full.iter().all(|entry| entry.account_id == first_id));
+        assert_eq!(full[0].tokens_since_last_cooldown.total_combined_tokens, 30);
+        assert_eq!(full[1].tokens_since_last_cooldown.total_combined_tokens, 10);
+    }
 }
 
 /// Central manager providing a single source of truth for auth.json derived
@@ -1457,6 +1542,28 @@ impl AuthManager {
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    pub fn set_preferred_account(&self, id: Uuid) -> std::io::Result<()> {
+        let mut guard = self.inner.write().map_err(|_| lock_poisoned())?;
+        let mut found = false;
+        let mut next_priority: u32 = 1;
+        for account in guard.accounts.iter_mut() {
+            if account.id == id {
+                account.priority = 0;
+                found = true;
+            } else {
+                account.priority = next_priority;
+                next_priority = next_priority.saturating_add(1);
+            }
+        }
+
+        if !found {
+            return Err(Error::other("account not found"));
+        }
+
+        sort_accounts(&mut guard.accounts);
+        self.persist_accounts(&mut guard.accounts)
     }
 
     /// Force a reload of the auth information from auth.json. Returns
@@ -1706,6 +1813,21 @@ impl AuthManager {
             }
         }
 
+        Ok(entries)
+    }
+
+    pub fn usage_history_for(
+        &self,
+        id: Uuid,
+        limit: Option<usize>,
+    ) -> std::io::Result<Vec<UsageLogEntry>> {
+        let mut entries = self.usage_history(None)?;
+        entries.retain(|entry| entry.account_id == id);
+        if let Some(limit) = limit {
+            if entries.len() > limit {
+                entries.truncate(limit);
+            }
+        }
         Ok(entries)
     }
 

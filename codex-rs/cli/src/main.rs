@@ -24,10 +24,8 @@ use owo_colors::OwoColorize;
 use std::path::PathBuf;
 use supports_color::Stream;
 
-mod auth_cmd;
 mod mcp_cmd;
 
-use crate::auth_cmd::AuthCommand;
 use crate::mcp_cmd::McpCli;
 use codex_core::config::Config;
 use codex_core::config::ConfigOverrides;
@@ -75,9 +73,6 @@ enum Subcommand {
 
     /// [experimental] Run Codex as an MCP server and manage MCP servers.
     Mcp(McpCli),
-
-    /// Manage authentication accounts and usage history.
-    Auth(AuthCommand),
 
     /// [experimental] Run the Codex MCP server (stdio transport).
     McpServer,
@@ -366,13 +361,6 @@ async fn cli_main(codex_linux_sandbox_exe: Option<PathBuf>) -> anyhow::Result<()
             // Propagate any root-level config overrides (e.g. `-c key=value`).
             prepend_config_flags(&mut mcp_cli.config_overrides, root_config_overrides.clone());
             mcp_cli.run().await?;
-        }
-        Some(Subcommand::Auth(mut auth_cli)) => {
-            prepend_config_flags(
-                &mut auth_cli.config_overrides,
-                root_config_overrides.clone(),
-            );
-            auth_cmd::run_auth_command(auth_cli).await?;
         }
         Some(Subcommand::AppServer) => {
             codex_app_server::run_main(codex_linux_sandbox_exe, root_config_overrides).await?;

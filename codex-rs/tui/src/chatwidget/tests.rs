@@ -1,4 +1,5 @@
 use super::*;
+use crate::account_state::AccountsState;
 use crate::app_event::AppEvent;
 use crate::app_event_sender::AppEventSender;
 use crate::test_backend::VT100Backend;
@@ -268,6 +269,7 @@ fn make_chatwidget_manual() -> (
         active_cell: None,
         config: cfg.clone(),
         auth_manager,
+        accounts_state: AccountsState::default(),
         session_header: SessionHeader::new(cfg.model),
         initial_user_message: None,
         token_info: None,

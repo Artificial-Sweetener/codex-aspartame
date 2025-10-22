@@ -44,7 +44,7 @@ use std::time::Duration;
 use tokio::select;
 use tokio::sync::mpsc::unbounded_channel;
 use tokio::task::spawn_blocking;
-// use uuid::Uuid;
+use uuid::Uuid;
 
 #[derive(Debug, Clone)]
 pub struct AppExitInfo {
@@ -84,7 +84,7 @@ pub(crate) struct App {
     pub(crate) pending_update_action: Option<UpdateAction>,
 
     pub(crate) accounts_state: AccountsState,
-    pub(crate) accounts_overlay_open: bool,
+    pub(crate) auth_overlay_open: bool,
 }
 
 impl App {
@@ -173,7 +173,7 @@ impl App {
             feedback: feedback.clone(),
             pending_update_action: None,
             accounts_state: AccountsState::default(),
-            accounts_overlay_open: false,
+            auth_overlay_open: false,
         };
 
         app.refresh_accounts_state().await;
@@ -212,6 +212,7 @@ impl App {
             Ok(Ok(snapshot)) => {
                 self.accounts_state.apply_snapshot(snapshot);
                 self.accounts_state.clear_error();
+                self.chat_widget.update_accounts_state(&self.accounts_state);
             }
             Ok(Err(err)) => {
                 tracing::error!(error = %err, "failed to refresh account state");
@@ -227,7 +228,7 @@ impl App {
     }
 
     fn rebuild_accounts_overlay(&mut self, tui: &mut tui::Tui) {
-        if !self.accounts_overlay_open {
+        if !self.auth_overlay_open {
             return;
         }
         let renderables = account_overlay::build_overlay(&self.accounts_state);
@@ -246,8 +247,44 @@ impl App {
             renderables,
             "A C C O U N T S".to_string(),
         ));
-        self.accounts_overlay_open = true;
+        self.auth_overlay_open = true;
         tui.frame_requester().schedule_frame();
+    }
+
+    async fn switch_to_account(&mut self, tui: &mut tui::Tui, account_id: Uuid) {
+        let auth_manager = Arc::clone(&self.auth_manager);
+        let result = spawn_blocking(move || auth_manager.set_preferred_account(account_id)).await;
+        match result {
+            Ok(Ok(())) => {
+                self.refresh_accounts_state().await;
+                if let Some(account) = self
+                    .accounts_state
+                    .accounts
+                    .iter()
+                    .find(|account| account.id == account_id)
+                {
+                    self.chat_widget
+                        .add_info_message(format!("Switched to {}", account.email), None);
+                } else {
+                    self.chat_widget
+                        .add_info_message("Switched active account.".to_string(), None);
+                }
+                if self.auth_overlay_open {
+                    self.rebuild_accounts_overlay(tui);
+                }
+            }
+            Ok(Err(err)) => {
+                tracing::error!(error = %err, "failed to switch account");
+                self.chat_widget
+                    .add_error_message(format!("Failed to switch account: {err}"));
+            }
+            Err(err) => {
+                tracing::error!(error = %err, "failed to join switch account task");
+                self.chat_widget.add_error_message(
+                    "Failed to switch account: background task error".to_string(),
+                );
+            }
+        }
     }
 
     pub(crate) async fn handle_tui_event(
@@ -364,7 +401,32 @@ impl App {
             AppEvent::AccountEvent(event) => {
                 self.accounts_state.record_event(&event);
                 self.refresh_accounts_state().await;
-                if self.accounts_overlay_open {
+                if self.auth_overlay_open {
+                    self.rebuild_accounts_overlay(tui);
+                }
+            }
+            AppEvent::OpenAuthSwitcher => {
+                self.chat_widget
+                    .open_auth_switcher_popup(&self.accounts_state);
+            }
+            AppEvent::OpenAuthInfo => {
+                self.open_accounts_overlay(tui).await;
+            }
+            AppEvent::LinkChatgptAccount => {
+                self.chat_widget.add_info_message(
+                    "ChatGPT account linking is not yet available in the TUI.".to_string(),
+                    None,
+                );
+            }
+            AppEvent::SwitchToAccount(account_id) => {
+                self.switch_to_account(tui, account_id).await;
+            }
+            AppEvent::ShowAccountHistory(account_id) => {
+                tracing::info!(%account_id, "account history requested (not yet implemented)");
+            }
+            AppEvent::RefreshAuthState => {
+                self.refresh_accounts_state().await;
+                if self.auth_overlay_open {
                     self.rebuild_accounts_overlay(tui);
                 }
             }
@@ -389,7 +451,7 @@ impl App {
                     pager_lines,
                     "D I F F".to_string(),
                 ));
-                self.accounts_overlay_open = false;
+                self.auth_overlay_open = false;
                 tui.frame_requester().schedule_frame();
             }
             AppEvent::StartFileSearch(query) => {
@@ -495,7 +557,7 @@ impl App {
                         vec![diff_summary.into()],
                         "P A T C H".to_string(),
                     ));
-                    self.accounts_overlay_open = false;
+                    self.auth_overlay_open = false;
                 }
                 ApprovalRequest::Exec { command, .. } => {
                     let _ = tui.enter_alt_screen();
@@ -505,7 +567,7 @@ impl App {
                         full_cmd_lines,
                         "E X E C".to_string(),
                     ));
-                    self.accounts_overlay_open = false;
+                    self.auth_overlay_open = false;
                 }
             },
         }
@@ -529,9 +591,9 @@ impl App {
                 kind: KeyEventKind::Press,
                 ..
             } => {
-                if self.accounts_overlay_open {
+                if self.auth_overlay_open {
                     self.close_transcript_overlay(tui);
-                    self.accounts_overlay_open = false;
+                    self.auth_overlay_open = false;
                 } else {
                     self.open_accounts_overlay(tui).await;
                 }
@@ -545,7 +607,7 @@ impl App {
                 // Enter alternate screen and set viewport to full size.
                 let _ = tui.enter_alt_screen();
                 self.overlay = Some(Overlay::new_transcript(self.transcript_cells.clone()));
-                self.accounts_overlay_open = false;
+                self.auth_overlay_open = false;
                 tui.frame_requester().schedule_frame();
             }
             // Esc primes/advances backtracking only in normal (not working) mode
@@ -646,7 +708,7 @@ mod tests {
             feedback: codex_feedback::CodexFeedback::new(),
             pending_update_action: None,
             accounts_state: AccountsState::default(),
-            accounts_overlay_open: false,
+            auth_overlay_open: false,
         }
     }
 
